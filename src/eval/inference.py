@@ -211,10 +211,10 @@ class VLMInference:
         
         # Configure sampling.
         self.sampling_params = SamplingParams(
-            temperature=0.0,
+            temperature=1.0,
             top_p=1.0,
             max_tokens=self.max_completion_length,
-            repetition_penalty = 1.05
+            repetition_penalty=1.05
         )
     
     def _init_chat_tokenizer(self, base_model_path):

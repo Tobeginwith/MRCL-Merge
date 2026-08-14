@@ -21,8 +21,11 @@ EXPECTED_NUM_DEVICES=8
 NUM_GENERATIONS=8
 BATCH_PER_DEVICE=4
 GRAD_ACCUM_STEPS=8
-STEPS_PER_GENERATION=32
+STEPS_PER_GENERATION=8
 LR=5e-6
+VLLM_TENSOR_PARALLEL_SIZE=4
+VLLM_GPU_MEMORY_UTILIZATION=0.40
+VLLM_MAX_MODEL_LENGTH=8192
 
 if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
     IFS=',' read -ra GPU_LIST <<< "$CUDA_VISIBLE_DEVICES"
@@ -94,6 +97,7 @@ echo "Using model: ${MODEL_NAME}"
 echo "Output: ${OUTPUT_DIR}"
 echo "GPUs: ${NUM_DEVICES}"
 echo "P0: per-device batch=${BATCH_PER_DEVICE}, gradient accumulation=${GRAD_ACCUM_STEPS}"
+echo "Rollout: vLLM colocate, tensor parallel=${VLLM_TENSOR_PARALLEL_SIZE}, GPU memory utilization=${VLLM_GPU_MEMORY_UTILIZATION}"
 echo "Max steps: ${MAX_STEPS}"
 echo "======================================"
 
@@ -111,6 +115,13 @@ deepspeed src/train/train_grpo.py \
     --bf16 True \
     --fp16 False \
     --disable_flash_attn2 False \
+    --use_vllm True \
+    --vllm_mode colocate \
+    --vllm_model_impl vllm \
+    --vllm_tensor_parallel_size "$VLLM_TENSOR_PARALLEL_SIZE" \
+    --vllm_gpu_memory_utilization "$VLLM_GPU_MEMORY_UTILIZATION" \
+    --vllm_max_model_length "$VLLM_MAX_MODEL_LENGTH" \
+    --vllm_enable_sleep_mode True \
     --output_dir "$OUTPUT_DIR" \
     --max_steps "$MAX_STEPS" \
     --num_generations "$NUM_GENERATIONS" \

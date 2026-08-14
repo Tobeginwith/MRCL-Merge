@@ -13,6 +13,7 @@ TASK_IDS=${TASK_IDS:-"1 2 3 4 5"}
 DO_EVAL=${DO_EVAL:-true}
 EVAL_BASE=${EVAL_BASE:-true}
 CONDA_PATH=${CONDA_PATH:-/mnt/project_modelware_roce/zhaojian/miniconda3}
+export CONDA_ENVS_PATH="${CONDA_PATH%/*}/conda_envs:${CONDA_PATH}/envs${CONDA_ENVS_PATH:+:${CONDA_ENVS_PATH}}"
 
 export CHECKPOINT_ROOT RESULTS_ROOT
 
@@ -34,7 +35,7 @@ die() {
 source "${CONDA_PATH}/etc/profile.d/conda.sh"
 
 activate_env() {
-    conda activate "${CONDA_PATH}/envs/$1"
+    conda activate "$1"
     export PATH="${CONDA_PREFIX}/bin:${PATH}"
     hash -r
 }
@@ -71,7 +72,7 @@ echo "Selected task IDs: ${SELECTED_TASK_IDS[*]}"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 echo "Training: temperature=0.8, P0 batch=4 x 8 GPUs x accumulation 8"
 echo "Conda path: ${CONDA_PATH}"
-echo "Training environment: trlQwen"
+echo "Training environment: trlQwenVllm"
 echo "Evaluation environment: vllmQwen"
 echo "Inference: temperature=0.0 (defined in src/eval/inference.py)"
 echo "Main log: ${MAIN_LOG}"
@@ -89,7 +90,7 @@ fi
 for TASK_ID in "${SELECTED_TASK_IDS[@]}"; do
     CUR_DATASET=${DATASETS[$((TASK_ID - 1))]}
 
-    activate_env trlQwen
+    activate_env trlQwenVllm
     TRAIN_LOG=${CHECKPOINT_ROOT}/logs/${CUR_DATASET}.log
     bash "${SCRIPT_DIR}/gspo_expert.sh" \
         "$BASE_MODEL" "$BASE_PATH" "$TASK_ID" "${DATASETS[@]}" 2>&1 | tee -a "$TRAIN_LOG"

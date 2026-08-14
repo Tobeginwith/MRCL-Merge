@@ -82,7 +82,7 @@ for TEST_DATASET in "${DATASETS[@]}"; do
         --media_dir "$MEDIA_DIR" \
         --output_dir "$RESULTS_DIR" \
         --prompts_file src/dataset/prompts_2.yaml \
-        --max_completion_length 2048 \
+        --max_completion_length 4096 \
         --tensor_parallel_size "$CHUNKS" \
         --batch_size "$BATCH_SIZE" \
         "${FLASH_ATTN_FLAG[@]}"
