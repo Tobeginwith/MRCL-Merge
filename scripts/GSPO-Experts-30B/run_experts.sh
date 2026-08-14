@@ -12,11 +12,7 @@ RESULTS_ROOT=${RESULTS_ROOT:-/mnt/project_modelware_roce_hs/zhaojian/zhc/blockda
 TASK_IDS=${TASK_IDS:-"1 2 3 4 5"}
 DO_EVAL=${DO_EVAL:-true}
 EVAL_BASE=${EVAL_BASE:-true}
-CONDA_ROOT=${CONDA_ROOT:-/mnt/project_modelware_roce/zhaojian/miniconda3}
-TRAIN_CONDA_ENV=${TRAIN_CONDA_ENV:-trlQwen}
-EVAL_CONDA_ENV=${EVAL_CONDA_ENV:-vllmQwen}
-TRAIN_CONDA_PREFIX=${TRAIN_CONDA_PREFIX:-${CONDA_ROOT}/envs/${TRAIN_CONDA_ENV}}
-EVAL_CONDA_PREFIX=${EVAL_CONDA_PREFIX:-${CONDA_ROOT}/envs/${EVAL_CONDA_ENV}}
+CONDA_PATH=${CONDA_PATH:-/mnt/project_modelware_roce/zhaojian/miniconda3}
 
 export CHECKPOINT_ROOT RESULTS_ROOT
 
@@ -34,60 +30,14 @@ die() {
 }
 
 
-initialize_conda() {
-    local conda_sh=${CONDA_ROOT}/etc/profile.d/conda.sh
-    [ -f "$conda_sh" ] || \
-        die "Conda initialization script not found: ${conda_sh}. Set CONDA_ROOT to the correct Miniconda root."
+# shellcheck source=/dev/null
+source "${CONDA_PATH}/etc/profile.d/conda.sh"
 
-    CONDA_ROOT=$(cd "$CONDA_ROOT" && pwd -P)
-    export CONDA_ROOT
-    export PATH="${CONDA_ROOT}/condabin:${PATH}"
+activate_env() {
+    conda activate "${CONDA_PATH}/envs/$1"
+    export PATH="${CONDA_PREFIX}/bin:${PATH}"
     hash -r
-
-    # Initialize conda inside this script; shell functions from a caller are not
-    # exported reliably to `bash run_experts.sh`.
-    set +u
-    # shellcheck source=/dev/null
-    source "${CONDA_ROOT}/etc/profile.d/conda.sh"
-    set -u
-
-    local detected_root
-    detected_root=$(conda info --base)
-    detected_root=$(cd "$detected_root" && pwd -P)
-    [ "$detected_root" = "$CONDA_ROOT" ] || \
-        die "Expected Conda root ${CONDA_ROOT}, but conda resolved to ${detected_root}."
 }
-
-activate_conda_env() {
-    local env_prefix=$1
-    local env_name=$2
-
-    [ -d "$env_prefix" ] || die "Conda environment directory not found: ${env_prefix}"
-    env_prefix=$(cd "$env_prefix" && pwd -P)
-    conda activate "$env_prefix" || die "Failed to activate Conda environment '${env_name}' at ${env_prefix}."
-
-    local active_prefix
-    active_prefix=$(cd "$CONDA_PREFIX" && pwd -P)
-    [ "$active_prefix" = "$env_prefix" ] || \
-        die "Expected Conda environment ${env_prefix}, but activated ${active_prefix}."
-
-    # A caller may already have another Conda installation activated. Put this
-    # environment first so its python/accelerate executables cannot be shadowed.
-    export PATH="${env_prefix}/bin:${PATH}"
-    hash -r
-
-    local python_exe
-    python_exe=$(command -v python) || die "python is unavailable after activating '${env_name}'."
-    case "$python_exe" in
-        "${env_prefix}/"*) ;;
-        *) die "Environment '${env_name}' is active, but python resolved outside it: ${python_exe}." ;;
-    esac
-    echo "Activated Conda environment: ${env_name} (${env_prefix})"
-    echo "Python executable: ${python_exe}"
-}
-
-
-initialize_conda
 
 command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is not available on PATH."
 
@@ -120,9 +70,9 @@ echo "MRCL data: ${BASE_PATH}"
 echo "Selected task IDs: ${SELECTED_TASK_IDS[*]}"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 echo "Training: temperature=0.8, P0 batch=4 x 8 GPUs x accumulation 8"
-echo "Conda root: ${CONDA_ROOT}"
-echo "Training environment: ${TRAIN_CONDA_ENV} (${TRAIN_CONDA_PREFIX})"
-echo "Evaluation environment: ${EVAL_CONDA_ENV} (${EVAL_CONDA_PREFIX})"
+echo "Conda path: ${CONDA_PATH}"
+echo "Training environment: trlQwen"
+echo "Evaluation environment: vllmQwen"
 echo "Inference: temperature=0.0 (defined in src/eval/inference.py)"
 echo "Main log: ${MAIN_LOG}"
 echo "======================================"
@@ -130,7 +80,7 @@ echo "======================================"
 nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader
 
 if [ "$EVAL_BASE" = true ]; then
-    activate_conda_env "$EVAL_CONDA_PREFIX" "$EVAL_CONDA_ENV"
+    activate_env vllmQwen
     BASE_EVAL_LOG=${RESULTS_ROOT}/logs/base.log
     bash "${SCRIPT_DIR}/eval_expert.sh" \
         "$BASE_MODEL" base "$BASE_PATH" "${DATASETS[@]}" 2>&1 | tee -a "$BASE_EVAL_LOG"
@@ -139,13 +89,13 @@ fi
 for TASK_ID in "${SELECTED_TASK_IDS[@]}"; do
     CUR_DATASET=${DATASETS[$((TASK_ID - 1))]}
 
-    activate_conda_env "$TRAIN_CONDA_PREFIX" "$TRAIN_CONDA_ENV"
+    activate_env trlQwen
     TRAIN_LOG=${CHECKPOINT_ROOT}/logs/${CUR_DATASET}.log
     bash "${SCRIPT_DIR}/gspo_expert.sh" \
         "$BASE_MODEL" "$BASE_PATH" "$TASK_ID" "${DATASETS[@]}" 2>&1 | tee -a "$TRAIN_LOG"
 
     if [ "$DO_EVAL" = true ]; then
-        activate_conda_env "$EVAL_CONDA_PREFIX" "$EVAL_CONDA_ENV"
+        activate_env vllmQwen
         EVAL_LOG=${RESULTS_ROOT}/logs/${CUR_DATASET}.log
         MODEL_NAME=${CHECKPOINT_ROOT}/training/${CUR_DATASET}
         bash "${SCRIPT_DIR}/eval_expert.sh" \
