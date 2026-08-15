@@ -4,6 +4,8 @@ from peft import LoraConfig
 import ast
 import yaml
 import pathlib
+from contextlib import contextmanager
+from functools import partial
 from transformers import (
     AutoProcessor, 
     AutoConfig,
@@ -27,6 +29,30 @@ local_rank = None
 def rank0_print(*args):
     if local_rank == 0 or local_rank == '0' or local_rank is None:
         print(*args)
+
+@contextmanager
+def patch_vllm_multimodal_processor(grpo_args, data_args):
+    """Keep vLLM and Transformers image tokenization in sync in colocate mode."""
+    if not (grpo_args.use_vllm and grpo_args.vllm_mode == "colocate"):
+        yield
+        return
+
+    import trl.trainer.grpo_trainer as trl_grpo_trainer
+
+    mm_processor_kwargs = {
+        "min_pixels": data_args.image_min_pixels,
+        "max_pixels": data_args.image_max_pixels,
+    }
+    original_llm = trl_grpo_trainer.LLM
+    trl_grpo_trainer.LLM = partial(
+        original_llm,
+        mm_processor_kwargs=mm_processor_kwargs,
+    )
+    rank0_print(f"vLLM multimodal processor kwargs: {mm_processor_kwargs}")
+    try:
+        yield
+    finally:
+        trl_grpo_trainer.LLM = original_llm
 
 def find_target_linear_names(model, num_lora_modules=-1, lora_namespan_exclude=[], verbose=True):
     linear_cls = torch.nn.modules.Linear
@@ -257,18 +283,19 @@ def train():
         peft_config=peft_config,
     )
 
-    if training_args.mask_path:
-        rank0_print(
-            f"[CLGRPOTrainer] Using importance-mask regularization: "
-            f"mask_path={training_args.mask_path}, mask_lambda={training_args.mask_lambda}"
-        )
-        trainer = CLGRPOTrainer(
-            mask_path=training_args.mask_path,
-            mask_lambda=training_args.mask_lambda,
-            **trainer_kwargs,
-        )
-    else:
-        trainer = GRPOTrainer(**trainer_kwargs)
+    with patch_vllm_multimodal_processor(grpo_args, data_args):
+        if training_args.mask_path:
+            rank0_print(
+                f"[CLGRPOTrainer] Using importance-mask regularization: "
+                f"mask_path={training_args.mask_path}, mask_lambda={training_args.mask_lambda}"
+            )
+            trainer = CLGRPOTrainer(
+                mask_path=training_args.mask_path,
+                mask_lambda=training_args.mask_lambda,
+                **trainer_kwargs,
+            )
+        else:
+            trainer = GRPOTrainer(**trainer_kwargs)
 
     trainable_params, all_param = count_parameters(model)
     param_stats = (
