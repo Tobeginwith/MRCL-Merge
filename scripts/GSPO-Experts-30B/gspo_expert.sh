@@ -13,18 +13,20 @@ shift 3
 DATASETS=("$@")
 
 
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+unset PYTORCH_CUDA_ALLOC_CONF
+unset PYTORCH_ALLOC_CONF
 export PYTHONPATH=src:${PYTHONPATH:-}
 
 # Fixed P0 configuration for a single 8 x H100 80GB node.
 EXPECTED_NUM_DEVICES=8
 NUM_GENERATIONS=8
-BATCH_PER_DEVICE=4
-GRAD_ACCUM_STEPS=8
-STEPS_PER_GENERATION=8
+BATCH_PER_DEVICE=2
+GRAD_ACCUM_STEPS=16
+STEPS_PER_GENERATION=16
+MAX_COMPLETION_LENGTH=4096
 LR=5e-6
 VLLM_TENSOR_PARALLEL_SIZE=4
-VLLM_GPU_MEMORY_UTILIZATION=0.40
+VLLM_GPU_MEMORY_UTILIZATION=0.50
 VLLM_MAX_MODEL_LENGTH=8192
 
 if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
@@ -98,6 +100,7 @@ echo "Output: ${OUTPUT_DIR}"
 echo "GPUs: ${NUM_DEVICES}"
 echo "P0: per-device batch=${BATCH_PER_DEVICE}, gradient accumulation=${GRAD_ACCUM_STEPS}"
 echo "Rollout: vLLM colocate, tensor parallel=${VLLM_TENSOR_PARALLEL_SIZE}, GPU memory utilization=${VLLM_GPU_MEMORY_UTILIZATION}"
+echo "Generation: max completion length=${MAX_COMPLETION_LENGTH}, steps per generation=${STEPS_PER_GENERATION}"
 echo "Max steps: ${MAX_STEPS}"
 echo "======================================"
 
@@ -127,7 +130,7 @@ deepspeed src/train/train_grpo.py \
     --num_generations "$NUM_GENERATIONS" \
     --per_device_train_batch_size "$BATCH_PER_DEVICE" \
     --gradient_accumulation_steps "$GRAD_ACCUM_STEPS" \
-    --max_completion_length 2048 \
+    --max_completion_length "$MAX_COMPLETION_LENGTH" \
     --image_min_pixels "$IMAGE_MIN_PIXELS" \
     --image_max_pixels "$IMAGE_MAX_PIXELS" \
     --learning_rate "$LR" \

@@ -32,10 +32,6 @@ fi
 
 IFS=',' read -ra GPU_LIST <<< "$CUDA_VISIBLE_DEVICES"
 CHUNKS=${#GPU_LIST[@]}
-if [ "$CHUNKS" -ne 8 ]; then
-    echo "30B evaluation expects exactly 8 visible GPUs; found ${CHUNKS}." >&2
-    exit 1
-fi
 
 echo "======================================"
 echo "Evaluating model: ${MODEL_LABEL}"
