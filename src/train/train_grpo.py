@@ -193,6 +193,18 @@ def train():
             **bnb_model_from_pretrained_args
         )
 
+    if config.model_type == "qwen3_vl_moe":
+        from deepspeed.utils import set_z3_leaf_modules
+
+        moe_leaf_modules = set_z3_leaf_modules(
+            model,
+            ["Qwen3VLMoeTextSparseMoeBlock"],
+        )
+        rank0_print(
+            f"Marked {len(moe_leaf_modules)} Qwen3-VL MoE blocks "
+            "as ZeRO-3 leaf modules"
+        )
+
 
     model.config.use_cache = False
     model_to_configure = model
