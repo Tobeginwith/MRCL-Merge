@@ -32,4 +32,8 @@ python -m pip install --no-deps --upgrade --force-reinstall \
     latex2sympy2-extended==1.10.2 \
     "mbridge @ git+https://github.com/ISEEKYAN/mbridge.git@$MBRIDGE_COMMIT"
 
+MBRIDGE_PACKAGE_DIR=$(python -c 'import importlib.util; print(next(iter(importlib.util.find_spec("mbridge").submodule_search_locations)))')
+sed -i 's/packed_seq_params\.cp_group is not None/getattr(packed_seq_params, "cp_group", None) is not None/' \
+    "$MBRIDGE_PACKAGE_DIR/models/qwen3_vl/model.py"
+
 echo "Ready: verl=$VERL_SRC, MBridge=$MBRIDGE_COMMIT, env=$CONDA_PREFIX"
