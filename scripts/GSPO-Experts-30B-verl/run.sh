@@ -56,10 +56,6 @@ for TASK_ID in ${TASK_IDS:-1}; do
         algorithm.adv_estimator=grpo
         algorithm.norm_adv_by_std_in_grpo=True
         algorithm.use_kl_in_reward=False
-        algorithm.rollout_correction.rollout_is=sequence
-        algorithm.rollout_correction.rollout_is_threshold=1e-10_3.0
-        algorithm.rollout_correction.rollout_is_batch_normalize=False
-        algorithm.rollout_correction.rollout_rs=null
         data.train_files="$TRAIN_FILE"
         data.val_files="$TEST_FILE"
         data.train_batch_size=32
@@ -153,7 +149,12 @@ for TASK_ID in ${TASK_IDS:-1}; do
     REWARD=(
         reward.custom_reward_function.path="$SCRIPT_DIR/data_and_reward.py"
         reward.custom_reward_function.name=compute_score
-        reward.reward_manager.name=naive
+        reward.reward_manager.name=dapo
+        +reward.reward_kwargs.overlong_buffer_cfg.enable=True
+        +reward.reward_kwargs.overlong_buffer_cfg.len=2048
+        +reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0
+        +reward.reward_kwargs.overlong_buffer_cfg.log=False
+        +reward.reward_kwargs.max_resp_len=4096
     )
 
     EXTRA=(
@@ -186,5 +187,5 @@ for TASK_ID in ${TASK_IDS:-1}; do
         "${REWARD[@]}" \
         "${TRAINER[@]}" \
         "${EXTRA[@]}" \
-        "$@" 2>&1 | tee -a "$LOG_DIR/train.log"
+        "$@" 2>&1 | tee "$LOG_DIR/train.log"
 done
