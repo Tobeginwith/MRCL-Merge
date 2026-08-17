@@ -162,7 +162,7 @@ cython_debug/
 #.idea/
 
 output
-outputs
+outputs/
 tf-logs
 tmp/
 scripts_tmp/
