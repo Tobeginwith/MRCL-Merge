@@ -48,8 +48,9 @@ for TASK_ID in ${TASK_IDS:-1}; do
     TEST_FILE="$BASE_PATH/$TASK/test.parquet"
     OUTPUT_DIR="$CHECKPOINT_ROOT/$TASK"
     LOG_DIR="$CHECKPOINT_ROOT/logs/$TASK"
+    VALIDATION_DIR="$CHECKPOINT_ROOT/validation/$TASK"
     export TENSORBOARD_DIR="$CHECKPOINT_ROOT/tensorboard/$TASK"
-    mkdir -p "$OUTPUT_DIR" "$LOG_DIR" "$TENSORBOARD_DIR"
+    mkdir -p "$OUTPUT_DIR" "$LOG_DIR" "$VALIDATION_DIR" "$TENSORBOARD_DIR"
 
     echo "Starting $TASK: steps=$MAX_STEPS, train=$TRAIN_FILE, val=$TEST_FILE, output=$OUTPUT_DIR"
     DATA=(
@@ -174,6 +175,7 @@ for TASK_ID in ${TASK_IDS:-1}; do
         trainer.save_freq=50
         trainer.default_local_dir="$OUTPUT_DIR"
         trainer.log_val_generations=8
+        trainer.validation_data_dir="$VALIDATION_DIR"
         trainer.resume_mode="$RESUME_MODE"
         trainer.resume_from_path="$RESUME_FROM_PATH"
     )
