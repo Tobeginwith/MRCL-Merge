@@ -1,16 +1,40 @@
 #!/bin/bash
 set -euo pipefail
 
-if [ "$#" -lt 4 ]; then
-    echo "Usage: $0 MODEL_NAME MODEL_LABEL BASE_PATH DATASET..." >&2
+if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then
+    echo "Usage: $0 MODEL_NAME MODEL_LABEL BASE_PATH [TASK_IDS]" >&2
+    echo "TASK_IDS is a quoted, space- or comma-separated list from 1 to 5; default: 1 2 3 4 5" >&2
     exit 2
 fi
 
 MODEL_NAME=$1
 MODEL_LABEL=$2
 BASE_PATH=$3
-shift 3
-DATASETS=("$@")
+TASK_IDS=${4:-"1 2 3 4 5"}
+
+DATASETS=(
+    MedBookVQA
+    Navigation
+    We-Math2
+    Puzzle
+    FinMME
+)
+
+# Accept both "1 3 5" and "1,3,5" in the fourth positional argument.
+read -r -a SELECTED_TASK_IDS <<< "${TASK_IDS//,/ }"
+if [ "${#SELECTED_TASK_IDS[@]}" -eq 0 ]; then
+    echo "TASK_IDS must contain at least one task ID." >&2
+    exit 2
+fi
+
+SELECTED_DATASETS=()
+for TASK_ID in "${SELECTED_TASK_IDS[@]}"; do
+    if ! [[ "$TASK_ID" =~ ^[1-5]$ ]]; then
+        echo "TASK_IDS only accepts values from 1 to 5: ${TASK_IDS}" >&2
+        exit 2
+    fi
+    SELECTED_DATASETS+=("${DATASETS[$((TASK_ID - 1))]}")
+done
 
 if ! [[ "$MODEL_LABEL" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "MODEL_LABEL may contain only letters, digits, dot, underscore, and hyphen." >&2
@@ -36,11 +60,12 @@ CHUNKS=${#GPU_LIST[@]}
 echo "======================================"
 echo "Evaluating model: ${MODEL_LABEL}"
 echo "Model path: ${MODEL_NAME}"
-echo "Test tasks: ${#DATASETS[@]}"
+echo "Task IDs: ${SELECTED_TASK_IDS[*]}"
+echo "Test tasks: ${#SELECTED_DATASETS[@]}"
 echo "Tensor parallel size: ${CHUNKS}"
 echo "======================================"
 
-for TEST_DATASET in "${DATASETS[@]}"; do
+for TEST_DATASET in "${SELECTED_DATASETS[@]}"; do
     TEST_FILE=${BASE_PATH}/${TEST_DATASET}/jsons/test/data.json
     MEDIA_DIR=${BASE_PATH}/${TEST_DATASET}/images
     RESULTS_DIR=${BASE_RESULTS_DIR}/${MODEL_LABEL}/${TEST_DATASET}
