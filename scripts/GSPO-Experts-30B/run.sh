@@ -36,11 +36,11 @@ ROLLOUT_GPU_MEMORY_UTILIZATION=0.50
 
 for TASK_ID in ${TASK_IDS:-1}; do
     case "$TASK_ID" in
-        1) TASK=MedBookVQA; MAX_STEPS=150; IMAGE_MIN_PIXELS=$((128*32*32)); IMAGE_MAX_PIXELS=$((512*32*32)) ;;
-        2) TASK=Navigation; MAX_STEPS=150; IMAGE_MIN_PIXELS=$((128*32*32)); IMAGE_MAX_PIXELS=$((512*32*32)) ;;
-        3) TASK=We-Math2; MAX_STEPS=600; IMAGE_MIN_PIXELS=$((64*32*32)); IMAGE_MAX_PIXELS=$((256*32*32)) ;;
-        4) TASK=Puzzle; MAX_STEPS=600; IMAGE_MIN_PIXELS=$((64*32*32)); IMAGE_MAX_PIXELS=$((256*32*32)) ;;
-        5) TASK=FinMME; MAX_STEPS=600; IMAGE_MIN_PIXELS=$((64*32*32)); IMAGE_MAX_PIXELS=$((256*32*32)) ;;
+        1) TASK=MedBookVQA; MAX_STEPS=150; LEARNING_RATE=0.000005; IMAGE_MIN_PIXELS=$((128*32*32)); IMAGE_MAX_PIXELS=$((512*32*32)) ;;
+        2) TASK=Navigation; MAX_STEPS=150; LEARNING_RATE=0.000005; IMAGE_MIN_PIXELS=$((128*32*32)); IMAGE_MAX_PIXELS=$((512*32*32)) ;;
+        3) TASK=We-Math2; MAX_STEPS=600; LEARNING_RATE=0.000005; IMAGE_MIN_PIXELS=$((64*32*32)); IMAGE_MAX_PIXELS=$((256*32*32)) ;;
+        4) TASK=Puzzle; MAX_STEPS=600; LEARNING_RATE=0.000005; IMAGE_MIN_PIXELS=$((64*32*32)); IMAGE_MAX_PIXELS=$((256*32*32)) ;;
+        5) TASK=FinMME; MAX_STEPS=600; LEARNING_RATE=0.000002; IMAGE_MIN_PIXELS=$((64*32*32)); IMAGE_MAX_PIXELS=$((256*32*32)) ;;
         *) echo "TASK_IDS only accepts 1..5" >&2; exit 2 ;;
     esac
     MAX_STEPS=${MAX_STEPS_OVERRIDE:-$MAX_STEPS}
@@ -86,7 +86,7 @@ for TASK_ID in ${TASK_IDS:-1}; do
         actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
         actor_rollout_ref.actor.use_dynamic_bsz="$USE_DYNAMIC_BSZ"
         actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$PPO_MAX_TOKEN_LEN_PER_GPU"
-        actor_rollout_ref.actor.optim.lr=0.000005
+        actor_rollout_ref.actor.optim.lr="$LEARNING_RATE"
         actor_rollout_ref.actor.optim.weight_decay=0.1
         actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.1
         actor_rollout_ref.actor.optim.lr_decay_style=cosine
