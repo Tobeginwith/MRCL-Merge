@@ -45,7 +45,7 @@ if [ ! -f "${MODEL_NAME}/config.json" ]; then
     exit 1
 fi
 
-BASE_RESULTS_DIR=${RESULTS_ROOT:-/mnt/project_modelware_roce_hs/zhaojian/zhc/blockdata/results/Qwen3-VL-30B-A3B-GSPO-Experts}
+BASE_RESULTS_DIR=${RESULTS_ROOT:-/mnt/project_modelware_roce_hs/zhaojian/zhc/blockdata/results}
 BATCH_SIZE=512
 DISABLE_FLASH_ATTN2=false
 
