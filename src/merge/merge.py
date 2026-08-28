@@ -11,6 +11,7 @@ Example:
     python src/merge/merge.py ta \\
         --base /path/Qwen3-VL-30B-A3B-Instruct \\
         --teachers /path/math /path/code /path/logic \\
+        --ta-center-router \\
         --scale 1.0 \\
         --output /path/merged_ta
 
@@ -293,12 +294,23 @@ def _merge_ta_tensor(
     base_tensor: torch.Tensor,
     teacher_tensors: Iterable[torch.Tensor],
     scale: float,
+    *,
+    center_expert_rows: bool = False,
 ) -> torch.Tensor:
     base_float = base_tensor.to(dtype=torch.float32, copy=True)
     merged_delta = torch.zeros_like(base_float)
     for teacher_tensor in teacher_tensors:
         delta = teacher_tensor.to(dtype=torch.float32, copy=True)
         delta.sub_(base_float)
+        if center_expert_rows:
+            if delta.ndim != 2:
+                raise ValueError(
+                    "Router centering expects a 2D [num_experts, hidden_size] tensor, "
+                    f"got shape {tuple(delta.shape)}"
+                )
+            # Adding the same row vector to every expert shifts all router logits
+            # equally. Remove that routing-invariant component from each task vector.
+            delta.sub_(delta.mean(dim=0, keepdim=True))
         merged_delta.add_(delta)
         del delta, teacher_tensor
     base_float.add_(merged_delta, alpha=scale)
@@ -306,12 +318,18 @@ def _merge_ta_tensor(
     return base_float.to(base_tensor.dtype)
 
 
+def _is_router_weight_key(key: str) -> bool:
+    """Match the Top-k router matrix in Qwen MoE decoder blocks."""
+    return key.endswith(".mlp.gate.weight")
+
+
 def merge_ta(
     base_state_dict: SafetensorCheckpoint | dict[str, torch.Tensor],
     teacher_state_dicts: list[SafetensorCheckpoint | dict[str, torch.Tensor]],
     scale: float = 1.0,
+    center_router: bool = False,
 ) -> _StreamingMergedStateDict | dict[str, torch.Tensor]:
-    """Task arithmetic: base + scale * sum_i(teacher_i - base)."""
+    """Task arithmetic, optionally centering each router task vector over experts."""
     if isinstance(base_state_dict, SafetensorCheckpoint):
         if not all(isinstance(sd, SafetensorCheckpoint) for sd in teacher_state_dicts):
             raise TypeError("Streaming TA requires safetensors checkpoint readers for all teachers")
@@ -320,6 +338,7 @@ def merge_ta(
             teacher_state_dicts,
             method="ta",
             scale=scale,
+            center_router=center_router,
         )
 
     merged: dict[str, torch.Tensor] = {}
@@ -328,6 +347,7 @@ def merge_ta(
             base_tensor,
             (teacher_sd[key] for teacher_sd in teacher_state_dicts),
             scale,
+            center_expert_rows=center_router and _is_router_weight_key(key),
         )
 
     return merged
@@ -454,12 +474,14 @@ class _StreamingMergedStateDict:
         method: str,
         scale: float,
         density: float = 0.2,
+        center_router: bool = False,
     ):
         self.base_state_dict = base_state_dict
         self.teacher_state_dicts = teacher_state_dicts
         self.method = method
         self.scale = scale
         self.density = density
+        self.center_router = center_router
 
     def keys(self) -> list[str]:
         return self.base_state_dict.keys()
@@ -494,6 +516,9 @@ class _StreamingMergedStateDict:
                 base_tensor,
                 self._teacher_tensors(key, expected_shape),
                 self.scale,
+                center_expert_rows=(
+                    self.center_router and _is_router_weight_key(key)
+                ),
             )
         if self.method == "ties":
             return _merge_ties_tensor(
@@ -728,6 +753,15 @@ def _parse_args() -> argparse.Namespace:
         help="Global scale applied to the summed TA task vector or merged TIES task vector (default: 1.0)",
     )
     parser.add_argument(
+        "--ta-center-router",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "For TA only, center every router task vector across its expert rows "
+            "before merging (default: False)"
+        ),
+    )
+    parser.add_argument(
         "--teacher-names",
         nargs="+",
         help="Optional labels used in validation error messages",
@@ -750,6 +784,8 @@ def main() -> None:
     args = _parse_args()
     if not args.base:
         raise SystemExit(f"{args.method} requires --base (shared pretrained checkpoint).")
+    if args.ta_center_router and args.method != "ta":
+        raise SystemExit("--ta-center-router can only be used with method 'ta'.")
 
     teacher_paths = [Path(p) for p in args.teachers]
     teacher_names = args.teacher_names or [p.name for p in teacher_paths]
@@ -780,7 +816,22 @@ def main() -> None:
 
         if args.method == "ta":
             print(f"TA scale: {args.scale}")
-            merged = merge_ta(base_state, teacher_states, scale=args.scale)
+            if args.ta_center_router:
+                router_count = sum(
+                    _is_router_weight_key(key) for key in base_state.keys()
+                )
+                if router_count == 0:
+                    raise ValueError(
+                        "--ta-center-router was enabled, but no Qwen MoE router "
+                        "weights ending in '.mlp.gate.weight' were found."
+                    )
+                print(f"TA router centering: enabled for {router_count} tensor(s)")
+            merged = merge_ta(
+                base_state,
+                teacher_states,
+                scale=args.scale,
+                center_router=args.ta_center_router,
+            )
         else:
             print(f"TIES density: {args.ties_density}; scale: {args.scale}")
             merged = merge_ties(
