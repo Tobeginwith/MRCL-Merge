@@ -14,8 +14,8 @@ checkpoint. The result is saved as a complete HuggingFace safetensors model.
 
 The script targets the Qwen3-VL-30B-A3B-Instruct packed expert layout:
 
-    ...mlp.experts.gate_up_proj  [num_experts, 2 * intermediate, hidden]
-    ...mlp.experts.down_proj     [num_experts, hidden, intermediate]
+    ...mlp.experts.gate_up_proj  [num_experts, hidden, 2 * intermediate]
+    ...mlp.experts.down_proj     [num_experts, intermediate, hidden]
 
 Example:
 
@@ -244,7 +244,10 @@ class ExpertLayerLayout:
             raise ValueError(f"Invalid expert slice [{start}:{end}]")
 
         gate_up = checkpoint.get_slice(self.gate_up_key, slice(start, end))
-        gate, up = gate_up.chunk(2, dim=1)
+        # Qwen3-VL-MoE stores packed expert projections in input-major form:
+        # [experts, hidden, 2 * intermediate]. The first half of the last
+        # dimension is gate_proj and the second half is up_proj.
+        gate, up = gate_up.chunk(2, dim=2)
         down = checkpoint.get_slice(self.down_key, slice(start, end))
         return gate, up, down
 
@@ -266,8 +269,8 @@ def _make_expert_layout(
             f"Qwen packed expert tensors at {prefix} must be 3D, got "
             f"{gate_up_shape} and {down_shape}"
         )
-    num_experts, twice_intermediate, hidden_size = gate_up_shape
-    down_experts, down_hidden, intermediate_size = down_shape
+    num_experts, hidden_size, twice_intermediate = gate_up_shape
+    down_experts, intermediate_size, down_hidden = down_shape
     if (
         twice_intermediate != 2 * intermediate_size
         or down_experts != num_experts
@@ -393,10 +396,12 @@ def _swiglu_expert_forward(
     up = up.to(device=device, dtype=compute_dtype)
     down = down.to(device=device, dtype=compute_dtype)
 
-    gate_hidden = torch.einsum("rh,eih->eri", probes, gate)
-    up_hidden = torch.einsum("rh,eih->eri", probes, up)
+    # gate/up: [experts, hidden, intermediate], matching z @ W.
+    gate_hidden = torch.einsum("rh,ehi->eri", probes, gate)
+    up_hidden = torch.einsum("rh,ehi->eri", probes, up)
     intermediate = F.silu(gate_hidden).mul_(up_hidden)
-    output = torch.einsum("eri,ehi->erh", intermediate, down)
+    # down: [experts, intermediate, hidden].
+    output = torch.einsum("eri,eih->erh", intermediate, down)
     return output.float()
 
 
