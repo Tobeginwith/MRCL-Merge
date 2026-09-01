@@ -1,40 +1,16 @@
 #!/usr/bin/env python3
-"""
-Merge task checkpoints while restricting MoE-expert merging to overlaps.
+"""TA/TIES merging restricted to overlapping Qwen3-VL MoE experts.
 
-Each task supplies one CSV produced by ``identify_important_experts.py``.
-For every Qwen3-VL-MoE layer and internal expert:
+Expert slots selected by zero, one, or multiple tasks use the base expert,
+copy the sole task expert, or merge only the selecting tasks, respectively.
+All other tensors are merged across every task checkpoint.
 
-  - selected by no task: keep the base expert;
-  - selected by one task: copy that task expert exactly;
-  - selected by two or more tasks: merge only those task experts with TA/TIES.
+Usage:
+    python src/merge/merge_overlap_only.py ties --base BASE \
+        --teachers MED PUZZLE NAV WEMATH --task-names medvqa puzzle navigation wemath2 \
+        --importance-dir SCORES --output OUTPUT
 
-All non-expert tensors (router, attention, vision tower, norms, embeddings,
-and so on) are merged normally across all task checkpoints. Checkpoints are
-read tensor-by-tensor and the complete output is saved in streaming HF shards.
-
-Examples:
-
-    python src/merge/merge_overlap_only.py ta \
-        --base /models/Qwen3-VL-30B-A3B-Instruct \
-        --teachers /models/med /models/puzzle /models/wemath /models/nav \
-        --importance-csvs /scores/med.csv /scores/puzzle.csv \
-                           /scores/wemath.csv /scores/nav.csv \
-        --output /models/overlap-ta
-
-    python src/merge/merge_overlap_only.py ties \
-        --base /models/Qwen3-VL-30B-A3B-Instruct \
-        --teachers /models/medvqa /models/puzzle /models/navigation /models/wemath2 \
-        --task-names medvqa puzzle navigation wemath2 \
-        --importance-dir /scores \
-        --ties-density 0.2 \
-        --output /models/overlap-ties
-
-The second command resolves, in teacher order,
-``/scores/<task>_functional_drift_scores.csv``. Qwen's packed
-``gate_up_proj`` is split into gate and up
-halves before an overlapping expert is merged, and the two independently
-merged halves are concatenated back into the packed checkpoint layout.
+``SCORES`` must contain ``<task>_functional_drift_scores.csv`` for each task.
 """
 
 from __future__ import annotations
@@ -190,25 +166,15 @@ def _resolve_importance_paths(
     *,
     teacher_dirs: list[Path],
     task_names: list[str],
-    importance_csvs: list[str] | None,
-    importance_dir: str | None,
+    importance_dir: str,
 ) -> list[Path]:
-    if importance_csvs is not None:
-        if len(importance_csvs) != len(teacher_dirs):
-            raise ValueError(
-                f"Expected {len(teacher_dirs)} --importance-csvs in teacher order, "
-                f"got {len(importance_csvs)}"
-            )
-        paths = [Path(path) for path in importance_csvs]
-    else:
-        assert importance_dir is not None
-        directory = Path(importance_dir)
-        if not directory.is_dir():
-            raise FileNotFoundError(f"Importance directory not found: {directory}")
-        paths = [
-            directory / f"{task_name}_functional_drift_scores.csv"
-            for task_name in task_names
-        ]
+    directory = Path(importance_dir)
+    if not directory.is_dir():
+        raise FileNotFoundError(f"Importance directory not found: {directory}")
+    paths = [
+        directory / f"{task_name}_functional_drift_scores.csv"
+        for task_name in task_names
+    ]
 
     for task_name, teacher_dir, csv_path in zip(task_names, teacher_dirs, paths):
         if not csv_path.is_file():
@@ -517,14 +483,9 @@ def _parse_args() -> argparse.Namespace:
             "--importance-dir lookup when CSV stems differ from teacher directory names."
         ),
     )
-    importance_group = parser.add_mutually_exclusive_group(required=True)
-    importance_group.add_argument(
-        "--importance-csvs",
-        nargs="+",
-        help="Importance CSV files in exactly the same order as --teachers",
-    )
-    importance_group.add_argument(
+    parser.add_argument(
         "--importance-dir",
+        required=True,
         help=(
             "Directory containing one "
             "<task-name>_functional_drift_scores.csv per teacher"
@@ -598,7 +559,6 @@ def main() -> None:
     importance_paths = _resolve_importance_paths(
         teacher_dirs=teacher_dirs,
         task_names=task_names,
-        importance_csvs=args.importance_csvs,
         importance_dir=args.importance_dir,
     )
 
