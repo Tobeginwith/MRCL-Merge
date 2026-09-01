@@ -32,7 +32,7 @@ try:
         discover_expert_layers,
         save_selected_checkpoint,
     )
-    from .merge import _is_router_weight_key, _merge_ta_tensor, _merge_ties_tensor
+    from .merge import _merge_ta_tensor, _merge_ties_tensor
 except ImportError:
     # Support direct execution: python src/merge/merge_overlap_only.py ...
     from identify_important_experts import (
@@ -42,7 +42,7 @@ except ImportError:
         discover_expert_layers,
         save_selected_checkpoint,
     )
-    from merge import _is_router_weight_key, _merge_ta_tensor, _merge_ties_tensor
+    from merge import _merge_ta_tensor, _merge_ties_tensor
 
 
 Selection = dict[int, set[int]]
@@ -213,7 +213,6 @@ class OverlapOnlyMergedCheckpoint:
         method: str,
         scale: float,
         ties_density: float,
-        center_router: bool,
     ):
         self.base = base
         self.teachers = teachers
@@ -221,7 +220,6 @@ class OverlapOnlyMergedCheckpoint:
         self.method = method
         self.scale = scale
         self.ties_density = ties_density
-        self.center_router = center_router
         self.expert_key_layout: dict[str, ExpertLayerLayout] = {}
         for layout in layouts:
             self.expert_key_layout[layout.gate_up_key] = layout
@@ -295,9 +293,6 @@ class OverlapOnlyMergedCheckpoint:
                 base_tensor,
                 self._teacher_full_tensors(key, all_tasks),
                 self.scale,
-                center_expert_rows=(
-                    self.center_router and _is_router_weight_key(key)
-                ),
             )
         return _merge_ties_tensor(
             base_tensor,
@@ -510,12 +505,6 @@ def _parse_args() -> argparse.Namespace:
         help="TIES retained task-vector density (default: 0.2)",
     )
     parser.add_argument(
-        "--ta-center-router",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="For TA, center each full router task vector across expert rows",
-    )
-    parser.add_argument(
         "--max-shard-size",
         default="5GB",
         help="Maximum output shard size (default: 5GB)",
@@ -544,8 +533,6 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    if args.method != "ta" and args.ta_center_router:
-        raise ValueError("--ta-center-router can only be used with method 'ta'")
     if not 0.0 < args.ties_density <= 1.0:
         raise ValueError("--ties-density must be in (0, 1]")
 
@@ -624,7 +611,6 @@ def main() -> None:
             method=args.method,
             scale=args.scale,
             ties_density=args.ties_density,
-            center_router=args.ta_center_router,
         )
         _save_overlap_report(
             output_dir,
