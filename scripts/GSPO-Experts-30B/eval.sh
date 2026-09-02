@@ -46,7 +46,7 @@ if [ ! -f "${MODEL_NAME}/config.json" ]; then
 fi
 
 BASE_RESULTS_DIR=${RESULTS_ROOT:-/mnt/project_modelware_roce_hs/zhaojian/zhc/blockdata/results}
-BATCH_SIZE=512
+BATCH_SIZE=1024
 DISABLE_FLASH_ATTN2=false
 
 if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
