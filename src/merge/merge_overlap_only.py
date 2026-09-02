@@ -3,7 +3,7 @@
 
 Expert slots selected by zero, one, or multiple tasks use the base expert,
 copy the sole task expert, or merge only the selecting tasks, respectively.
-All other tensors are merged across every task checkpoint.
+TA averages the selecting task experts; all other tensors use the global scale.
 
 Usage:
     python src/merge/merge_overlap_only.py ties --base BASE \
@@ -271,18 +271,19 @@ class OverlapOnlyMergedCheckpoint:
         self,
         base_tensor: torch.Tensor,
         teacher_tensor_factory,
+        merge_scale: float,
     ) -> torch.Tensor:
         if self.method == "ta":
             return _merge_ta_tensor(
                 base_tensor,
                 teacher_tensor_factory(),
-                self.scale,
+                merge_scale,
             )
         return _merge_ties_tensor(
             base_tensor,
             teacher_tensor_factory,
             self.ties_density,
-            self.scale,
+            merge_scale,
         )
 
     def _merge_full_tensor(self, key: str) -> torch.Tensor:
@@ -309,6 +310,11 @@ class OverlapOnlyMergedCheckpoint:
         task_indices: tuple[int, ...],
     ) -> torch.Tensor:
         base_slice = self.base.get_slice(key, slice(expert_id, expert_id + 1))[0]
+        # For TA, base + mean(selected task vectors) is exactly the arithmetic
+        # mean of the selected teacher weights. TIES keeps the global scale.
+        merge_scale = (
+            1.0 / len(task_indices) if self.method == "ta" else self.scale
+        )
         if key == layout.gate_up_key:
             # Qwen stores [hidden, gate_intermediate || up_intermediate].
             # Merge the logical projections independently so that TIES trims
@@ -319,18 +325,21 @@ class OverlapOnlyMergedCheckpoint:
                 lambda: self._teacher_gate_up_component_slices(
                     key, expert_id, task_indices, 0
                 ),
+                merge_scale,
             )
             merged_up = self._merge_selected_tensor(
                 base_up,
                 lambda: self._teacher_gate_up_component_slices(
                     key, expert_id, task_indices, 1
                 ),
+                merge_scale,
             )
             return torch.cat((merged_gate, merged_up), dim=-1)
 
         return self._merge_selected_tensor(
             base_slice,
             lambda: self._teacher_expert_slices(key, expert_id, task_indices),
+            merge_scale,
         )
 
     def _merge_packed_expert_tensor(
@@ -378,15 +387,26 @@ def _save_overlap_report(
     selected_action: str,
 ) -> None:
     counts = Counter(len(task_indices) for task_indices in selected_teachers.values())
+    overlap_rule = (
+        "mean_selected_task_experts"
+        if method == "ta"
+        else "ties_selected_tasks_only"
+    )
     summary = {
         "method": method,
         "scale": scale,
+        "scale_scope": (
+            "non_expert_tensors_only"
+            if method == "ta"
+            else "non_expert_and_overlapping_expert_tensors"
+        ),
+        "expert_ta_rule": "selected_mean" if method == "ta" else None,
         "ties_density": ties_density if method == "ties" else None,
         "selected_action": selected_action,
         "semantics": {
             "selected_by_zero": "base",
             "selected_by_one": "copy_private_task_expert",
-            "selected_by_multiple": f"{method}_selected_tasks_only",
+            "selected_by_multiple": overlap_rule,
             "overlap_gate_up_proj": "split_gate_and_up_merge_independently_then_concat",
             "non_expert_tensors": f"{method}_all_tasks",
         },
@@ -406,6 +426,10 @@ def _save_overlap_report(
             "overlap": sum(
                 count for num_tasks, count in counts.items() if num_tasks >= 2
             ),
+            "by_num_selected_tasks": {
+                str(num_tasks): counts.get(num_tasks, 0)
+                for num_tasks in range(len(task_names) + 1)
+            },
         },
     }
     with (output_dir / "overlap_merge_summary.json").open(
@@ -437,7 +461,11 @@ def _save_overlap_report(
                 elif len(task_indices) == 1:
                     operation = "copy_private"
                 else:
-                    operation = f"{method}_overlap"
+                    operation = (
+                        "ta_selected_mean"
+                        if method == "ta"
+                        else "ties_overlap"
+                    )
                 writer.writerow(
                     [
                         layout.layer_index,
@@ -496,7 +524,10 @@ def _parse_args() -> argparse.Namespace:
         "--scale",
         type=float,
         default=1.0,
-        help="TA/TIES task-vector scale (default: 1.0)",
+        help=(
+            "Scale for non-expert TA tensors, or for non-expert and overlapping "
+            "TIES tensors. TA expert slots use selected-task means (default: 1.0)"
+        ),
     )
     parser.add_argument(
         "--ties-density",
@@ -602,6 +633,11 @@ def main() -> None:
                     f"  selected by {num_tasks} tasks: "
                     f"{count_by_tasks[num_tasks]} expert slot(s)"
                 )
+        if args.method == "ta":
+            print(
+                "TA expert rule: mean of selecting task experts; "
+                f"non-expert scale={args.scale}"
+            )
 
         merged_state = OverlapOnlyMergedCheckpoint(
             base,
