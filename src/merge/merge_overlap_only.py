@@ -3,7 +3,8 @@
 
 Expert slots selected by zero, one, or multiple tasks use the base expert,
 copy the sole task expert, or merge only the selecting tasks, respectively.
-TA averages the selecting task experts; all other tensors use the global scale.
+Overlapping experts use an independent scale; all other tensors use the global
+scale.
 
 Usage:
     python src/merge/merge_overlap_only.py ties --base BASE \
@@ -212,6 +213,7 @@ class OverlapOnlyMergedCheckpoint:
         *,
         method: str,
         scale: float,
+        overlap_scale: float,
         ties_density: float,
     ):
         self.base = base
@@ -219,6 +221,7 @@ class OverlapOnlyMergedCheckpoint:
         self.selected_teachers = selected_teachers
         self.method = method
         self.scale = scale
+        self.overlap_scale = overlap_scale
         self.ties_density = ties_density
         self.expert_key_layout: dict[str, ExpertLayerLayout] = {}
         for layout in layouts:
@@ -310,11 +313,10 @@ class OverlapOnlyMergedCheckpoint:
         task_indices: tuple[int, ...],
     ) -> torch.Tensor:
         base_slice = self.base.get_slice(key, slice(expert_id, expert_id + 1))[0]
-        # For TA, base + mean(selected task vectors) is exactly the arithmetic
-        # mean of the selected teacher weights. TIES keeps the global scale.
-        merge_scale = (
-            1.0 / len(task_indices) if self.method == "ta" else self.scale
-        )
+        # Apply the overlap-specific scale directly to the selected task-vector
+        # sum. In particular, TA computes base + overlap_scale * sum(delta_i),
+        # without normalizing by the number of selecting tasks.
+        merge_scale = self.overlap_scale
         if key == layout.gate_up_key:
             # Qwen stores [hidden, gate_intermediate || up_intermediate].
             # Merge the logical projections independently so that TIES trims
@@ -383,24 +385,27 @@ def _save_overlap_report(
     importance_paths: list[Path],
     method: str,
     scale: float,
+    overlap_scale: float,
     ties_density: float,
     selected_action: str,
 ) -> None:
     counts = Counter(len(task_indices) for task_indices in selected_teachers.values())
     overlap_rule = (
-        "mean_selected_task_experts"
+        "ta_selected_task_vector_sum"
         if method == "ta"
         else "ties_selected_tasks_only"
     )
     summary = {
         "method": method,
         "scale": scale,
-        "scale_scope": (
-            "non_expert_tensors_only"
+        "scale_scope": "non_expert_tensors_only",
+        "overlap_scale": overlap_scale,
+        "overlap_scale_scope": "overlapping_expert_tensors_only",
+        "expert_ta_rule": (
+            "base_plus_overlap_scale_times_selected_task_vector_sum"
             if method == "ta"
-            else "non_expert_and_overlapping_expert_tensors"
+            else None
         ),
-        "expert_ta_rule": "selected_mean" if method == "ta" else None,
         "ties_density": ties_density if method == "ties" else None,
         "selected_action": selected_action,
         "semantics": {
@@ -462,7 +467,7 @@ def _save_overlap_report(
                     operation = "copy_private"
                 else:
                     operation = (
-                        "ta_selected_mean"
+                        "ta_selected_sum"
                         if method == "ta"
                         else "ties_overlap"
                     )
@@ -525,8 +530,17 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help=(
-            "Scale for non-expert TA tensors, or for non-expert and overlapping "
-            "TIES tensors. TA expert slots use selected-task means (default: 1.0)"
+            "Scale for all non-expert TA/TIES tensors (default: 1.0)"
+        ),
+    )
+    parser.add_argument(
+        "--overlap-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Independent scale for overlapping expert tensors. TA applies it "
+            "to the sum of selected task vectors without averaging; TIES applies "
+            "it to its merged selected-task vector (default: 1.0)"
         ),
     )
     parser.add_argument(
@@ -635,7 +649,9 @@ def main() -> None:
                 )
         if args.method == "ta":
             print(
-                "TA expert rule: mean of selecting task experts; "
+                "TA overlap expert rule: base + overlap_scale * "
+                "sum(selected task vectors); "
+                f"overlap scale={args.overlap_scale}; "
                 f"non-expert scale={args.scale}"
             )
 
@@ -646,6 +662,7 @@ def main() -> None:
             selected_teachers,
             method=args.method,
             scale=args.scale,
+            overlap_scale=args.overlap_scale,
             ties_density=args.ties_density,
         )
         _save_overlap_report(
@@ -658,6 +675,7 @@ def main() -> None:
             importance_paths=importance_paths,
             method=args.method,
             scale=args.scale,
+            overlap_scale=args.overlap_scale,
             ties_density=args.ties_density,
             selected_action=args.selected_action,
         )
