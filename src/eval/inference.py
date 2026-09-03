@@ -201,7 +201,7 @@ class VLMInference:
             "trust_remote_code": True,
             "dtype": "bfloat16",
             "max_model_len": 32768,
-            "gpu_memory_utilization": 0.9,
+            "gpu_memory_utilization": 0.95,
             "tensor_parallel_size": tensor_parallel_size,
             "limit_mm_per_prompt": {"image": 50},
         }
