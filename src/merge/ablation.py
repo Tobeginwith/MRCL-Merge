@@ -2,9 +2,10 @@
 """Merge non-expert parameters while anchoring all routed MoE experts.
 
 All tensors except Qwen packed routed-expert weights are merged across every
-teacher with Task Arithmetic or TIES. For each discovered MoE layer, the full
-``mlp.experts.gate_up_proj`` and ``mlp.experts.down_proj`` tensors are copied
-unchanged from ``--experts-anchor``. The anchor must be one of ``--teachers``.
+teacher with Task Arithmetic or TIES. By default, every routed expert is copied
+unchanged from ``--experts-anchor``. With ``--key-anchor-only``, only experts
+marked ``keep_task`` in ``--key-experts-csv`` are copied from the anchor; every
+other routed expert is copied from the base model.
 
 Vision-tower tensors under ``model.visual.*`` are merged by default. If
 ``--vision-anchor`` is supplied, the complete vision tower is instead copied
@@ -23,6 +24,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from collections.abc import Iterable
@@ -97,6 +99,71 @@ def _expert_keys(layouts: list[ExpertLayerLayout]) -> frozenset[str]:
     )
 
 
+def _contiguous_ranges(indices: list[int]) -> list[tuple[int, int]]:
+    if not indices:
+        return []
+    ranges: list[tuple[int, int]] = []
+    start = previous = indices[0]
+    for index in indices[1:]:
+        if index == previous + 1:
+            previous = index
+            continue
+        ranges.append((start, previous + 1))
+        start = previous = index
+    ranges.append((start, previous + 1))
+    return ranges
+
+
+def _read_key_expert_slots(
+    path: Path,
+    layouts: list[ExpertLayerLayout],
+) -> frozenset[tuple[int, int]]:
+    """Read keep_task slots and require exact layer/expert CSV coverage."""
+    if not path.is_file():
+        raise FileNotFoundError(f"Key-expert CSV not found: {path}")
+
+    selected: set[tuple[int, int]] = set()
+    seen: set[tuple[int, int]] = set()
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        required = {"layer_index", "expert_id", "action"}
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(
+                f"{path} is missing required columns: {sorted(missing)}"
+            )
+        for row_number, row in enumerate(reader, start=2):
+            try:
+                slot = (int(row["layer_index"]), int(row["expert_id"]))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid layer_index/expert_id at {path}:{row_number}"
+                ) from exc
+            if slot in seen:
+                raise ValueError(
+                    f"Duplicate layer/expert row at {path}:{row_number}: {slot}"
+                )
+            seen.add(slot)
+            if (row.get("action") or "").strip() == "keep_task":
+                selected.add(slot)
+
+    expected = {
+        (layout.layer_index, expert_id)
+        for layout in layouts
+        for expert_id in range(layout.num_experts)
+    }
+    if seen != expected:
+        missing = sorted(expected - seen)
+        extra = sorted(seen - expected)
+        raise ValueError(
+            f"Key-expert CSV coverage mismatch for {path}: "
+            f"missing={missing[:10]}, extra={extra[:10]}"
+        )
+    if not selected:
+        raise ValueError(f"No experts with action='keep_task' found in {path}")
+    return frozenset(selected)
+
+
 def _vision_keys(base: SafetensorCheckpoint) -> frozenset[str]:
     keys = frozenset(key for key in base.keys() if key.startswith("model.visual."))
     if not keys:
@@ -107,14 +174,15 @@ def _vision_keys(base: SafetensorCheckpoint) -> frozenset[str]:
 
 
 class AnchorExpertsMergedCheckpoint:
-    """Stream merged non-expert tensors and copied anchor expert tensors."""
+    """Stream merged non-experts and anchor/base expert slices."""
 
     def __init__(
         self,
         base: SafetensorCheckpoint,
         teachers: list[SafetensorCheckpoint],
         anchor: SafetensorCheckpoint,
-        expert_keys: frozenset[str],
+        layouts: list[ExpertLayerLayout],
+        key_anchor_slots: frozenset[tuple[int, int]] | None,
         vision_anchor: SafetensorCheckpoint | None,
         vision_keys: frozenset[str],
         *,
@@ -125,7 +193,13 @@ class AnchorExpertsMergedCheckpoint:
         self.base = base
         self.teachers = teachers
         self.anchor = anchor
-        self.expert_keys = expert_keys
+        self.expert_keys = _expert_keys(layouts)
+        self.expert_key_layout = {
+            key: layout
+            for layout in layouts
+            for key in (layout.gate_up_key, layout.down_key)
+        }
+        self.key_anchor_slots = key_anchor_slots
         self.vision_anchor = vision_anchor
         self.vision_keys = vision_keys
         self.method = method
@@ -144,7 +218,7 @@ class AnchorExpertsMergedCheckpoint:
         return source.get_dtype(key)
 
     def _anchored_source(self, key: str) -> SafetensorCheckpoint | None:
-        if key in self.expert_keys:
+        if key in self.expert_keys and self.key_anchor_slots is None:
             return self.anchor
         if self.vision_anchor is not None and key in self.vision_keys:
             return self.vision_anchor
@@ -171,12 +245,32 @@ class AnchorExpertsMergedCheckpoint:
             )
         raise ValueError(f"Unsupported merge method: {self.method}")
 
+    def _copy_key_anchor_experts(
+        self,
+        key: str,
+        layout: ExpertLayerLayout,
+    ) -> torch.Tensor:
+        output = self.base.get_tensor(key).clone()
+        expert_ids = sorted(
+            expert_id
+            for layer_index, expert_id in self.key_anchor_slots or ()
+            if layer_index == layout.layer_index
+        )
+        for start, end in _contiguous_ranges(expert_ids):
+            output[start:end].copy_(
+                self.anchor.get_slice(key, slice(start, end))
+            )
+        return output
+
     def get_tensor(self, key: str) -> torch.Tensor:
-        if key in self.expert_keys:
+        layout = self.expert_key_layout.get(key)
+        if layout is not None and self.key_anchor_slots is None:
             # gate_up_proj is packed as
             # [num_experts, hidden, gate_intermediate || up_intermediate].
             # Copy that complete packed tensor exactly; do not split or merge it.
             return self.anchor.get_tensor(key)
+        if layout is not None:
+            return self._copy_key_anchor_experts(key, layout)
         if self.vision_anchor is not None and key in self.vision_keys:
             return self.vision_anchor.get_tensor(key)
         return self._merge_non_expert_tensor(key)
@@ -192,9 +286,21 @@ def _save_summary(
     teacher_dirs: list[Path],
     teacher_names: list[str],
     anchor_dir: Path,
+    key_anchor_only: bool,
+    key_experts_csv: Path | None,
+    key_anchor_slots: frozenset[tuple[int, int]] | None,
     vision_anchor_dir: Path | None,
     layouts: list[ExpertLayerLayout],
 ) -> None:
+    total_expert_slots = sum(layout.num_experts for layout in layouts)
+    anchored_expert_slots = (
+        len(key_anchor_slots) if key_anchor_slots is not None else total_expert_slots
+    )
+    expert_rule = (
+        "copy_keep_task_anchor_slices_else_base"
+        if key_anchor_only
+        else "copy_all_anchor_experts"
+    )
     summary = {
         "method": method,
         "scale": scale,
@@ -205,16 +311,23 @@ def _save_summary(
             for name, path in zip(teacher_names, teacher_dirs)
         ],
         "experts_anchor": str(anchor_dir.resolve()),
+        "key_anchor_only": key_anchor_only,
+        "key_experts_csv": (
+            str(key_experts_csv.resolve()) if key_experts_csv is not None else None
+        ),
         "vision_anchor": (
             str(vision_anchor_dir.resolve())
             if vision_anchor_dir is not None
             else None
         ),
         "num_moe_layers": len(layouts),
-        "num_anchored_expert_tensors": 2 * len(layouts),
+        "num_expert_parameter_tensors": 2 * len(layouts),
+        "num_total_expert_slots": total_expert_slots,
+        "num_anchored_expert_slots": anchored_expert_slots,
+        "num_base_expert_slots": total_expert_slots - anchored_expert_slots,
         "semantics": {
-            "mlp.experts.gate_up_proj": "copy_complete_packed_anchor_tensor",
-            "mlp.experts.down_proj": "copy_complete_anchor_tensor",
+            "mlp.experts.gate_up_proj": expert_rule,
+            "mlp.experts.down_proj": expert_rule,
             "vision_tower": (
                 "copy_complete_vision_anchor"
                 if vision_anchor_dir is not None
@@ -234,9 +347,9 @@ def _save_summary(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Merge non-expert tensors with TA/TIES while copying all Qwen "
-            "packed MoE expert tensors, and optionally the vision tower, from "
-            "anchors."
+            "Merge non-expert tensors with TA/TIES while copying all or only "
+            "selected Qwen packed MoE experts, and optionally the vision tower, "
+            "from anchors."
         )
     )
     parser.add_argument("method", choices=["ta", "ties"])
@@ -258,6 +371,21 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Teacher checkpoint whose gate_up_proj/down_proj expert tensors are "
             "copied; must be one of --teachers"
+        ),
+    )
+    parser.add_argument(
+        "--key-anchor-only",
+        action="store_true",
+        help=(
+            "Copy only experts marked keep_task in --key-experts-csv from "
+            "--experts-anchor; copy every other routed expert from --base"
+        ),
+    )
+    parser.add_argument(
+        "--key-experts-csv",
+        help=(
+            "Functional-drift CSV for --experts-anchor. Required with "
+            "--key-anchor-only and rejected otherwise"
         ),
     )
     parser.add_argument(
@@ -322,6 +450,13 @@ def main() -> None:
     anchor_index = _resolve_teacher_index(
         teacher_dirs, anchor_dir, "--experts-anchor"
     )
+    key_experts_csv = (
+        Path(args.key_experts_csv) if args.key_experts_csv is not None else None
+    )
+    if args.key_anchor_only and key_experts_csv is None:
+        raise ValueError("--key-experts-csv is required with --key-anchor-only")
+    if not args.key_anchor_only and key_experts_csv is not None:
+        raise ValueError("--key-experts-csv requires --key-anchor-only")
     vision_anchor_dir = Path(args.vision_anchor) if args.vision_anchor else None
     vision_anchor_index = (
         _resolve_teacher_index(
@@ -358,6 +493,11 @@ def main() -> None:
         _validate_checkpoint_compatibility(base, teachers)
         layouts = discover_expert_layers(base)
         expert_keys = _expert_keys(layouts)
+        key_anchor_slots = (
+            _read_key_expert_slots(key_experts_csv, layouts)
+            if key_experts_csv is not None
+            else None
+        )
         vision_keys = _vision_keys(base)
         anchor = teachers[anchor_index]
         vision_anchor = (
@@ -366,10 +506,18 @@ def main() -> None:
             else None
         )
 
-        print(
-            f"Anchoring {len(expert_keys)} packed expert tensors across "
-            f"{len(layouts)} MoE layers from {teacher_dirs[anchor_index]}"
-        )
+        if key_anchor_slots is None:
+            print(
+                f"Anchoring {len(expert_keys)} packed expert tensors across "
+                f"{len(layouts)} MoE layers from {teacher_dirs[anchor_index]}"
+            )
+        else:
+            total_expert_slots = sum(layout.num_experts for layout in layouts)
+            print(
+                f"Key-anchor-only: copying {len(key_anchor_slots)}/"
+                f"{total_expert_slots} expert slots from "
+                f"{teacher_dirs[anchor_index]}; all other expert slots use base"
+            )
         if vision_anchor is None:
             print(
                 f"Merging all remaining tensors, including vision and routers, "
@@ -391,7 +539,8 @@ def main() -> None:
             base,
             teachers,
             anchor,
-            expert_keys,
+            layouts,
+            key_anchor_slots,
             vision_anchor,
             vision_keys,
             method=args.method,
@@ -407,6 +556,9 @@ def main() -> None:
             teacher_dirs=teacher_dirs,
             teacher_names=teacher_names,
             anchor_dir=anchor_dir,
+            key_anchor_only=args.key_anchor_only,
+            key_experts_csv=key_experts_csv,
+            key_anchor_slots=key_anchor_slots,
             vision_anchor_dir=vision_anchor_dir,
             layouts=layouts,
         )
