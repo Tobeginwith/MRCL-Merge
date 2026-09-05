@@ -2,7 +2,8 @@
 """Repair MoE experts whose task behavior is lost after model merging.
 
 The script uses a previously merged checkpoint as the context model and
-scores the target task's experts in every layer with shared Rademacher hidden-state probes:
+scores each target task's experts in every layer with shared Rademacher
+hidden-state probes:
 
     I_task = mean_r ||f_task(z_r) - f_base(z_r)||_2^2
                     / (||f_base(z_r)||_2^2 + eps)
@@ -12,12 +13,14 @@ scores the target task's experts in every layer with shared Rademacher hidden-st
 
     I_repair = sqrt(I_task * I_lost)
 
-Only ``--target-task`` is scored.  It must identify one entry in
-``--task-names`` and therefore one teacher in ``--teachers``.  The highest
-scoring experts are selected independently in every layer.  Selected packed
-``gate_up_proj`` and ``down_proj`` expert slices are copied completely from
-the target teacher; all other tensors remain exactly those of the context
-checkpoint.
+All ``--task-names`` are scored by default; ``--target-tasks`` can select a
+subset (``--target-task`` remains an alias).  The highest scoring experts are
+selected independently for each task in every layer.  Experts selected by
+exactly one task have their packed ``gate_up_proj`` and ``down_proj`` slices
+copied completely from that task's teacher.  Experts selected by multiple
+tasks are left unchanged, without selecting replacement candidates.  All
+scores use the original context checkpoint, and all other tensors remain
+exactly those of that checkpoint.
 
 Example:
 
@@ -26,7 +29,7 @@ Example:
         --context-model /models/TA-alpha0.5 \
         --teachers /models/med /models/puzzle /models/nav /models/math \
         --task-names medvqa puzzle navigation wemath2 \
-        --target-task puzzle \
+        --target-tasks puzzle navigation \
         --repair-fraction 0.125 \
         --selection-score geometric \
         --output /models/TA-alpha0.5-conflict-repair
@@ -44,6 +47,7 @@ import json
 import math
 import statistics
 import sys
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -120,6 +124,23 @@ def _resolve_task_names(
     if len(set(names)) != len(names):
         raise ValueError(f"Task names must be unique, got {names}")
     return names
+
+
+def _resolve_target_tasks(
+    task_names: list[str], target_tasks_arg: list[str] | None
+) -> list[str]:
+    target_tasks = task_names if target_tasks_arg is None else target_tasks_arg
+    if not target_tasks:
+        raise ValueError("At least one target task is required")
+    if len(set(target_tasks)) != len(target_tasks):
+        raise ValueError(f"Target tasks must be unique, got {target_tasks}")
+    unknown = sorted(set(target_tasks) - set(task_names))
+    if unknown:
+        raise ValueError(
+            f"--target-tasks must be drawn from --task-names. "
+            f"Unknown tasks={unknown}; choices={task_names}"
+        )
+    return target_tasks
 
 
 @torch.inference_mode()
@@ -280,7 +301,7 @@ def select_repairs(
 
     selected: set[Slot] = set()
     print(
-        f"Selecting repairs for target task {target_task!r} "
+        f"Selecting repair candidates for target task {target_task!r} "
         f"using {selection_score}:"
     )
     for layout in layouts:
@@ -306,29 +327,48 @@ def select_repairs(
                 for expert_id in repaired
             )
             print(
-                f"  {layout.label}: repairing {len(repaired)}/"
+                f"  {layout.label}: selected {len(repaired)}/"
                 f"{layout.num_experts} experts "
                 f"({selection_score} >= {threshold:.6g})"
             )
         else:
-            print(f"  {layout.label}: repairing 0/{layout.num_experts} experts")
+            print(f"  {layout.label}: selected 0/{layout.num_experts} experts")
 
     return frozenset(selected)
 
 
+def resolve_repair_conflicts(
+    selected_by_task: dict[str, frozenset[Slot]],
+) -> tuple[dict[Slot, str], frozenset[Slot]]:
+    """Assign uniquely selected slots; leave all multiply selected slots alone."""
+
+    repair_sources: dict[Slot, str] = {}
+    conflicts: set[Slot] = set()
+    for task, selected_slots in selected_by_task.items():
+        for slot in selected_slots:
+            if slot in conflicts:
+                continue
+            if slot in repair_sources:
+                del repair_sources[slot]
+                conflicts.add(slot)
+            else:
+                repair_sources[slot] = task
+    return repair_sources, frozenset(conflicts)
+
+
 class ConflictRepairCheckpoint:
-    """Copy context and replace selected expert slices from one teacher."""
+    """Copy context and replace only expert slices with a unique source task."""
 
     def __init__(
         self,
         context: SafetensorCheckpoint,
-        teacher: SafetensorCheckpoint,
+        teachers: dict[str, SafetensorCheckpoint],
         layouts: list[ExpertLayerLayout],
-        repair_slots: frozenset[Slot],
+        repair_sources: dict[Slot, str],
     ) -> None:
         self.context = context
-        self.teacher = teacher
-        self.repair_slots = repair_slots
+        self.teachers = teachers
+        self.repair_sources = repair_sources
         self.expert_key_layout = {
             key: layout
             for layout in layouts
@@ -350,14 +390,14 @@ class ConflictRepairCheckpoint:
         layout: ExpertLayerLayout,
     ) -> torch.Tensor:
         output = self.context.get_tensor(key).clone()
-        expert_ids = sorted(
-            expert_id
-            for layer_index, expert_id in self.repair_slots
+        expert_sources = sorted(
+            (expert_id, task)
+            for (layer_index, expert_id), task in self.repair_sources.items()
             if layer_index == layout.layer_index
         )
-        for expert_id in expert_ids:
+        for expert_id, task in expert_sources:
             # Copy the complete packed gate_up or down expert slice exactly.
-            source = self.teacher.get_slice(
+            source = self.teachers[task].get_slice(
                 key, slice(expert_id, expert_id + 1)
             )[0]
             output[expert_id].copy_(source)
@@ -374,12 +414,13 @@ def _save_reports(
     output_dir: Path,
     *,
     layouts: list[ExpertLayerLayout],
-    scores: TaskScoreMap,
-    repair_slots: frozenset[Slot],
-    target_task: str,
+    scores_by_task: dict[str, TaskScoreMap],
+    selected_by_task: dict[str, frozenset[Slot]],
+    repair_sources: dict[Slot, str],
+    conflict_slots: frozenset[Slot],
     base_dir: Path,
     context_dir: Path,
-    target_teacher_dir: Path,
+    target_teacher_dirs: dict[str, Path],
     repair_fraction: float,
     selection_score: str,
     num_probes: int,
@@ -389,12 +430,19 @@ def _save_reports(
     compute_dtype: torch.dtype,
 ) -> None:
     total_slots = sum(layout.num_experts for layout in layouts)
+    selected_tasks_by_slot: dict[Slot, list[str]] = {}
+    for task, slots in selected_by_task.items():
+        for slot in slots:
+            selected_tasks_by_slot.setdefault(slot, []).append(task)
+
     report = {
-        "method": "data_free_single_task_post_merge_conflict_repair",
+        "method": "data_free_multi_task_post_merge_conflict_repair",
         "base_model": str(base_dir.resolve()),
         "context_model": str(context_dir.resolve()),
-        "target_task": target_task,
-        "target_teacher": str(target_teacher_dir.resolve()),
+        "target_tasks": list(target_teacher_dirs),
+        "target_teachers": {
+            task: str(path.resolve()) for task, path in target_teacher_dirs.items()
+        },
         "formulas": {
             "I_task": (
                 "mean_r(||f_task(z_r)-f_base(z_r)||_2^2 / "
@@ -415,16 +463,33 @@ def _save_reports(
         "repair_fraction": repair_fraction,
         "selection_score": selection_score,
         "selection_rule": (
-            f"highest {selection_score} scores within each layer for target task"
+            f"highest {selection_score} scores independently per task within "
+            "each layer; floor(num_experts * repair_fraction) candidates"
         ),
+        "conflict_rule": "keep_context_if_selected_by_multiple_tasks; no_backfill",
         "expert_slot_counts": {
-            "unchanged_context": total_slots - len(repair_slots),
-            "repaired_from_target_teacher": len(repair_slots),
+            "unchanged_context": total_slots - len(repair_sources),
+            "repaired_from_target_teachers": len(repair_sources),
+            "unselected_context": total_slots - len(selected_tasks_by_slot),
+            "conflicted_kept_context": len(conflict_slots),
+        },
+        "per_task_slot_counts": {
+            task: {
+                "selected_for_repair": len(slots),
+                "repaired_from_teacher": sum(
+                    repair_sources.get(slot) == task for slot in slots
+                ),
+                "conflicted_kept_context": len(slots & conflict_slots),
+            }
+            for task, slots in selected_by_task.items()
         },
         "semantics": {
-            "selected_expert": "copy_complete_target_teacher_expert",
+            "uniquely_selected_expert": "copy_complete_selecting_task_teacher_expert",
+            "multiply_selected_expert": "copy_context",
             "unselected_expert": "copy_context",
             "non_expert_tensors": "copy_context",
+            "scoring_context": "original_context_for_all_tasks",
+            "csv_action": "final_expert_action_shared_by_all_task_rows",
         },
         "limitation": (
             "expert-local synthetic probes; routing frequency, attention, vision, "
@@ -452,25 +517,42 @@ def _save_reports(
                 "I_lost",
                 "geometric_mean",
                 "action",
+                "selected_for_repair",
+                "selected_by_tasks",
+                "repair_source_task",
             ]
         )
-        for layout in layouts:
-            for expert_id in range(layout.num_experts):
-                slot = (layout.layer_index, expert_id)
-                score = scores[slot]
-                writer.writerow(
-                    [
-                        target_task,
-                        str(target_teacher_dir.resolve()),
-                        layout.layer_index,
-                        layout.label,
-                        expert_id,
-                        f"{score.i_task:.17g}",
-                        f"{score.i_lost:.17g}",
-                        f"{score.geometric_mean:.17g}",
-                        "repair" if slot in repair_slots else "keep_context",
-                    ]
-                )
+        for task, scores in scores_by_task.items():
+            for layout in layouts:
+                for expert_id in range(layout.num_experts):
+                    slot = (layout.layer_index, expert_id)
+                    score = scores[slot]
+                    source_task = repair_sources.get(slot)
+                    if slot in conflict_slots:
+                        action = "keep_context_conflict"
+                    elif source_task is not None:
+                        action = "repair"
+                    else:
+                        action = "keep_context"
+                    writer.writerow(
+                        [
+                            task,
+                            str(target_teacher_dirs[task].resolve()),
+                            layout.layer_index,
+                            layout.label,
+                            expert_id,
+                            f"{score.i_task:.17g}",
+                            f"{score.i_lost:.17g}",
+                            f"{score.geometric_mean:.17g}",
+                            action,
+                            slot in selected_by_task[task],
+                            json.dumps(
+                                selected_tasks_by_slot.get(slot, []),
+                                ensure_ascii=False,
+                            ),
+                            source_task if source_task is not None else "",
+                        ]
+                    )
 
     print(
         "Conflict-repair reports saved: conflict_repair_summary.json, "
@@ -478,12 +560,11 @@ def _save_reports(
     )
 
 
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Use data-free post-merge functional loss to repair one target "
-            "task's Qwen3-VL packed MoE experts."
+            "Use data-free post-merge functional loss to repair target tasks' "
+            "Qwen3-VL packed MoE experts, keeping conflicting experts unchanged."
         )
     )
     parser.add_argument("--base", required=True, help="Local base checkpoint")
@@ -493,8 +574,8 @@ def _parse_args() -> argparse.Namespace:
         dest="context_model",
         required=True,
         help=(
-            "Previously merged checkpoint to score and repair. All unselected "
-            "experts and non-expert tensors are copied from this model"
+            "Previously merged checkpoint to score and repair. Unselected or "
+            "conflicting experts and non-expert tensors are copied from this model"
         ),
     )
     parser.add_argument(
@@ -510,9 +591,11 @@ def _parse_args() -> argparse.Namespace:
         help="Unique task names in the same order as --teachers",
     )
     parser.add_argument(
+        "--target-tasks",
         "--target-task",
-        required=True,
-        help="Single task to repair; must be one of --task-names",
+        dest="target_tasks",
+        nargs="+",
+        help="Tasks to repair from --task-names (default: all tasks)",
     )
     parser.add_argument("--output", required=True, help="Output HF checkpoint")
     parser.add_argument(
@@ -520,8 +603,9 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=0.125,
         help=(
-            "Highest selected-score fraction copied from the target teacher "
-            "in every layer (default: 0.125)"
+            "Highest selected-score fraction nominated independently per task "
+            "in every layer; overlapping nominations keep context weights "
+            "without backfilling (default: 0.125)"
         ),
     )
     parser.add_argument(
@@ -609,13 +693,11 @@ def main() -> None:
     context_dir = Path(args.context_model)
     teacher_dirs = [Path(path) for path in args.teachers]
     task_names = _resolve_task_names(teacher_dirs, args.task_names)
-    if args.target_task not in task_names:
-        raise ValueError(
-            f"--target-task must be one of --task-names. "
-            f"Got {args.target_task!r}; choices={task_names}"
-        )
-    target_index = task_names.index(args.target_task)
-    target_teacher_dir = teacher_dirs[target_index]
+    target_tasks = _resolve_target_tasks(task_names, args.target_tasks)
+    teachers_by_name = dict(zip(task_names, teacher_dirs))
+    target_teacher_dirs = {
+        task: teachers_by_name[task] for task in target_tasks
+    }
     output_dir = Path(args.output)
     processor_source = (
         Path(args.processor_source) if args.processor_source else context_dir
@@ -641,18 +723,16 @@ def main() -> None:
     compute_dtype = _resolve_compute_dtype(args.compute_dtype, device)
     print(f"Scoring device={device}, compute_dtype={compute_dtype}")
     print(f"Context model: {context_dir}")
-    print(
-        f"Target task: {args.target_task}; "
-        f"teacher={target_teacher_dir}"
-    )
+    print(f"Target tasks: {', '.join(target_tasks)}")
 
-    base = SafetensorCheckpoint(base_dir)
-    context: SafetensorCheckpoint | None = None
-    target_teacher: SafetensorCheckpoint | None = None
-    try:
-        context = SafetensorCheckpoint(context_dir)
-        target_teacher = SafetensorCheckpoint(target_teacher_dir)
-        _validate_checkpoint_compatibility(base, [context, target_teacher])
+    with ExitStack() as stack:
+        base = stack.enter_context(SafetensorCheckpoint(base_dir))
+        context = stack.enter_context(SafetensorCheckpoint(context_dir))
+        teachers = {
+            task: stack.enter_context(SafetensorCheckpoint(path))
+            for task, path in target_teacher_dirs.items()
+        }
+        _validate_checkpoint_compatibility(base, [context, *teachers.values()])
         layouts = discover_expert_layers(base)
         hidden_sizes = {layout.hidden_size for layout in layouts}
         if len(hidden_sizes) != 1:
@@ -669,52 +749,59 @@ def main() -> None:
         probes = make_rademacher_probes(
             args.num_probes, hidden_size, args.seed
         )
-        scores = score_conflict_repairs(
-            base,
-            context,
-            target_teacher,
-            layouts,
-            probes,
-            target_task=args.target_task,
-            device=device,
-            compute_dtype=compute_dtype,
-            expert_batch_size=args.expert_batch_size,
-            eps=args.eps,
-        )
-        repair_slots = select_repairs(
-            layouts,
-            scores,
-            target_task=args.target_task,
-            repair_fraction=args.repair_fraction,
-            selection_score=args.selection_score,
-        )
+        scores_by_task: dict[str, TaskScoreMap] = {}
+        selected_by_task: dict[str, frozenset[Slot]] = {}
+        for task, teacher in teachers.items():
+            print(f"Scoring target task: {task}; teacher={target_teacher_dirs[task]}")
+            scores = score_conflict_repairs(
+                base,
+                context,
+                teacher,
+                layouts,
+                probes,
+                target_task=task,
+                device=device,
+                compute_dtype=compute_dtype,
+                expert_batch_size=args.expert_batch_size,
+                eps=args.eps,
+            )
+            scores_by_task[task] = scores
+            selected_by_task[task] = select_repairs(
+                layouts,
+                scores,
+                target_task=task,
+                repair_fraction=args.repair_fraction,
+                selection_score=args.selection_score,
+            )
 
+        repair_sources, conflict_slots = resolve_repair_conflicts(selected_by_task)
         total_slots = sum(layout.num_experts for layout in layouts)
         print(
-            f"Repair slots for {args.target_task}: "
-            f"selected={len(repair_slots)}, "
-            f"unchanged={total_slots - len(repair_slots)}"
+            f"Repair slots: repaired={len(repair_sources)}, "
+            f"conflicted_kept_context={len(conflict_slots)}, "
+            f"unchanged={total_slots - len(repair_sources)}"
         )
         print(
-            "All non-expert tensors and unselected expert slots are copied "
-            "unchanged from the context model."
+            "Experts selected by multiple tasks, unselected experts, and all "
+            "non-expert tensors are copied unchanged from the context model."
         )
 
         repaired_state = ConflictRepairCheckpoint(
             context,
-            target_teacher,
+            teachers,
             layouts,
-            repair_slots,
+            repair_sources,
         )
         _save_reports(
             output_dir,
             layouts=layouts,
-            scores=scores,
-            repair_slots=repair_slots,
-            target_task=args.target_task,
+            scores_by_task=scores_by_task,
+            selected_by_task=selected_by_task,
+            repair_sources=repair_sources,
+            conflict_slots=conflict_slots,
             base_dir=base_dir,
             context_dir=context_dir,
-            target_teacher_dir=target_teacher_dir,
+            target_teacher_dirs=target_teacher_dirs,
             repair_fraction=args.repair_fraction,
             selection_score=args.selection_score,
             num_probes=args.num_probes,
@@ -732,15 +819,9 @@ def main() -> None:
             save_processor=args.save_processor,
             trust_remote_code=args.trust_remote_code,
         )
-    finally:
-        if target_teacher is not None:
-            target_teacher.close()
-        if context is not None:
-            context.close()
-        base.close()
 
     print(
-        f"Done. Conflict-repaired checkpoint for {args.target_task} "
+        f"Done. Conflict-repaired checkpoint for {', '.join(target_tasks)} "
         f"-> {output_dir}"
     )
 
