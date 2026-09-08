@@ -724,8 +724,9 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Use data-free post-merge functional loss to repair target tasks' "
-            "Qwen3-VL packed MoE experts: copy unique teachers and apply "
-            "directional deltas to overlaps assigned by maximum I_lost."
+            "Qwen3-VL packed MoE experts: copy the teacher at uniquely selected "
+            "slots; at shared slots, add the sum of directionally weighted "
+            "teacher-minus-base deltas from all selecting tasks to the context."
         )
     )
     parser.add_argument("--base", required=True, help="Local base checkpoint")
@@ -765,8 +766,9 @@ def _parse_args() -> argparse.Namespace:
         default=0.125,
         help=(
             "Highest selected-score fraction nominated independently per task "
-            "in every layer; overlaps use a directional delta from the selecting "
-            "teacher with maximum I_lost, without backfilling (default: 0.125)"
+            "in every layer; shared slots sum directionally weighted deltas "
+            "only from tasks selecting that slot, without backfilling "
+            "(default: 0.125)"
         ),
     )
     parser.add_argument(
