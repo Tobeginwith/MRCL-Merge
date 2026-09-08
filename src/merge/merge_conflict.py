@@ -17,10 +17,24 @@ All ``--task-names`` are scored by default; ``--target-tasks`` can select a
 subset (``--target-task`` remains an alias).  The highest scoring experts are
 selected independently for each task in every layer.  Experts selected by
 exactly one task have their packed ``gate_up_proj`` and ``down_proj`` slices
-copied completely from that task's teacher.  Experts selected by multiple
-tasks are left unchanged, without selecting replacement candidates.  All
-scores use the original context checkpoint, and all other tensors remain
-exactly those of that checkpoint.
+copied completely from that task's teacher.  Experts selected by several tasks
+are shared, so no single teacher may claim them: every selecting task adds its
+own directional delta to the context weights at that slot,
+
+    theta = theta_context + sum_{t in S} a_t * (theta_t - theta_base)
+
+where ``S`` is the set of tasks that selected the expert and
+
+    a_t = clip(sum((f_t-f_context)*(f_t-f_base)) /
+               (sum((f_t-f_base)^2)+eps), 0, 1)
+
+sums over all probes and output dimensions.  Each task's coefficient is fitted
+independently, and the contributions are summed rather than averaged so that
+every selecting task's delta is amplified exactly as much as a uniquely
+selected task's delta is by a full teacher copy.  The same coefficient is used
+for gate_up and down; the weight update is computed in FP32 and cast to the
+context storage dtype.  All scores and updates use the original context
+checkpoint, and all other tensors remain exactly those of that checkpoint.
 
 Example:
 
@@ -76,14 +90,38 @@ Slot = tuple[int, int]
 
 @dataclass(frozen=True)
 class RepairScore:
-    """The three relative functional scores for one task/expert slot."""
+    """Relative functional scores and a directional compensation coefficient."""
 
     i_task: float
     i_lost: float
     geometric_mean: float
+    repair_coefficient: float = 0.0
 
 
 TaskScoreMap = dict[Slot, RepairScore]
+
+
+def directional_repair_coefficient(
+    base_output: torch.Tensor,
+    context_output: torch.Tensor,
+    task_output: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Project the missing task output over all probes and output dimensions.
+
+    Inputs have shape [experts, probes, hidden]. This is a ratio of summed
+    inner products, not a mean of per-probe ratios. Arithmetic is float32.
+    """
+    if not math.isfinite(eps) or eps <= 0:
+        raise ValueError("eps must be finite and positive")
+    task_delta = task_output.float() - base_output.float()
+    missing = task_output.float() - context_output.float()
+    numerator = (missing * task_delta).sum(dim=(-2, -1))
+    denominator = task_delta.square().sum(dim=(-2, -1)) + eps
+    coefficient = numerator / denominator
+    if not torch.isfinite(coefficient).all():
+        raise FloatingPointError("Non-finite directional repair coefficient")
+    return coefficient.clamp(0.0, 1.0)
 
 
 def _validate_checkpoint_compatibility(
@@ -237,6 +275,9 @@ def score_conflict_repairs(
                     "Try --compute-dtype float32."
                 )
 
+            coefficients = directional_repair_coefficient(
+                base_output, context_output, task_output, eps
+            ).cpu().tolist()
             task_values = i_task.cpu().tolist()
             lost_values = i_lost.cpu().tolist()
             geometric_values = geometric.cpu().tolist()
@@ -245,6 +286,7 @@ def score_conflict_repairs(
                     i_task=float(task_values[offset]),
                     i_lost=float(lost_values[offset]),
                     geometric_mean=float(geometric_values[offset]),
+                    repair_coefficient=float(coefficients[offset]),
                 )
                 scores[(layout.layer_index, expert_id)] = score
                 layer_scores.append(score)
@@ -339,25 +381,33 @@ def select_repairs(
 
 def resolve_repair_conflicts(
     selected_by_task: dict[str, frozenset[Slot]],
-) -> tuple[dict[Slot, str], frozenset[Slot]]:
-    """Assign uniquely selected slots; leave all multiply selected slots alone."""
+) -> tuple[dict[Slot, str], dict[Slot, tuple[str, ...]]]:
+    """Split selected slots into single-owner copies and shared slots.
 
-    repair_sources: dict[Slot, str] = {}
-    conflicts: set[Slot] = set()
+    A slot selected by several tasks carries capability all of them need, so it
+    is never awarded to one teacher.  Both return values are keyed by slot:
+    uniquely selected slots map to their owning task, shared slots map to the
+    tuple of every selecting task in ``selected_by_task`` insertion order (the
+    CLI target-task order), which keeps the summed update deterministic.
+    """
+
+    selected_tasks_by_slot: dict[Slot, list[str]] = {}
     for task, selected_slots in selected_by_task.items():
         for slot in selected_slots:
-            if slot in conflicts:
-                continue
-            if slot in repair_sources:
-                del repair_sources[slot]
-                conflicts.add(slot)
-            else:
-                repair_sources[slot] = task
-    return repair_sources, frozenset(conflicts)
+            selected_tasks_by_slot.setdefault(slot, []).append(task)
+
+    repair_sources: dict[Slot, str] = {}
+    shared_tasks: dict[Slot, tuple[str, ...]] = {}
+    for slot, selected_tasks in selected_tasks_by_slot.items():
+        if len(selected_tasks) == 1:
+            repair_sources[slot] = selected_tasks[0]
+        else:
+            shared_tasks[slot] = tuple(selected_tasks)
+    return repair_sources, shared_tasks
 
 
 class ConflictRepairCheckpoint:
-    """Copy context and replace only expert slices with a unique source task."""
+    """Copy single-owner teachers and sum directional deltas at shared slots."""
 
     def __init__(
         self,
@@ -365,10 +415,34 @@ class ConflictRepairCheckpoint:
         teachers: dict[str, SafetensorCheckpoint],
         layouts: list[ExpertLayerLayout],
         repair_sources: dict[Slot, str],
+        *,
+        base: SafetensorCheckpoint,
+        shared_tasks: dict[Slot, tuple[str, ...]],
+        shared_coefficients: dict[Slot, tuple[float, ...]],
     ) -> None:
+        if repair_sources.keys() & shared_tasks.keys():
+            raise ValueError("A slot cannot be both single-owner and shared")
+        if shared_coefficients.keys() != shared_tasks.keys():
+            raise ValueError("Shared coefficient coverage must match shared slots")
+        for slot, tasks in shared_tasks.items():
+            if len(tasks) < 2:
+                raise ValueError(f"Shared slot {slot} needs at least two tasks")
+            if len(set(tasks)) != len(tasks):
+                raise ValueError(f"Shared slot {slot} repeats a task")
+            if len(shared_coefficients[slot]) != len(tasks):
+                raise ValueError(f"Shared slot {slot} coefficient count mismatch")
+        if any(
+            not math.isfinite(a) or not 0.0 <= a <= 1.0
+            for coefficients in shared_coefficients.values()
+            for a in coefficients
+        ):
+            raise ValueError("Shared coefficients must be finite and in [0, 1]")
         self.context = context
         self.teachers = teachers
         self.repair_sources = repair_sources
+        self.base = base
+        self.shared_tasks = shared_tasks
+        self.shared_coefficients = shared_coefficients
         self.expert_key_layout = {
             key: layout
             for layout in layouts
@@ -396,11 +470,31 @@ class ConflictRepairCheckpoint:
             if layer_index == layout.layer_index
         )
         for expert_id, task in expert_sources:
-            # Copy the complete packed gate_up or down expert slice exactly.
-            source = self.teachers[task].get_slice(
-                key, slice(expert_id, expert_id + 1)
-            )[0]
+            # A single nomination keeps the original full-teacher copy.
+            index = slice(expert_id, expert_id + 1)
+            source = self.teachers[task].get_slice(key, index)[0]
             output[expert_id].copy_(source)
+
+        shared_experts = sorted(
+            (expert_id, tasks)
+            for (layer_index, expert_id), tasks in self.shared_tasks.items()
+            if layer_index == layout.layer_index
+        )
+        for expert_id, tasks in shared_experts:
+            slot = (layout.layer_index, expert_id)
+            coefficients = self.shared_coefficients[slot]
+            if all(a == 0.0 for a in coefficients):
+                continue
+            index = slice(expert_id, expert_id + 1)
+            base = self.base.get_slice(key, index)[0].float()
+            # Accumulate every selecting task's delta in FP32, then cast once.
+            repaired = output[expert_id].float()
+            for task, coefficient in zip(tasks, coefficients):
+                if coefficient == 0.0:
+                    continue
+                source = self.teachers[task].get_slice(key, index)[0].float()
+                repaired = repaired + coefficient * (source - base)
+            output[expert_id].copy_(repaired.to(output.dtype))
         return output
 
     def get_tensor(self, key: str) -> torch.Tensor:
@@ -410,6 +504,20 @@ class ConflictRepairCheckpoint:
         return self._repair_packed_expert_tensor(key, layout)
 
 
+def _summarize_values(values: list[float]) -> dict[str, float | int]:
+    """Report the spread of a diagnostic quantity, or zeros when it is empty."""
+
+    if not values:
+        return {"n": 0, "min": 0.0, "median": 0.0, "mean": 0.0, "max": 0.0}
+    return {
+        "n": len(values),
+        "min": min(values),
+        "median": statistics.median(values),
+        "mean": sum(values) / len(values),
+        "max": max(values),
+    }
+
+
 def _save_reports(
     output_dir: Path,
     *,
@@ -417,7 +525,7 @@ def _save_reports(
     scores_by_task: dict[str, TaskScoreMap],
     selected_by_task: dict[str, frozenset[Slot]],
     repair_sources: dict[Slot, str],
-    conflict_slots: frozenset[Slot],
+    shared_tasks: dict[Slot, tuple[str, ...]],
     base_dir: Path,
     context_dir: Path,
     target_teacher_dirs: dict[str, Path],
@@ -436,7 +544,7 @@ def _save_reports(
             selected_tasks_by_slot.setdefault(slot, []).append(task)
 
     report = {
-        "method": "data_free_multi_task_post_merge_conflict_repair",
+        "method": "data_free_multi_task_post_merge_directional_conflict_repair",
         "base_model": str(base_dir.resolve()),
         "context_model": str(context_dir.resolve()),
         "target_tasks": list(target_teacher_dirs),
@@ -453,6 +561,14 @@ def _save_reports(
                 "(||f_task(z_r)||_2^2+eps))"
             ),
             "repair_score": "sqrt(I_task * I_lost)",
+            "shared_weight_update": (
+                "theta_context + sum_{t in selecting_tasks} a_t * "
+                "(theta_t - theta_base)"
+            ),
+            "repair_coefficient": (
+                "clip(sum_rh((f_task-f_context)*(f_task-f_base)) / "
+                "(sum_rh((f_task-f_base)^2)+eps), 0, 1)"
+            ),
         },
         "probe_distribution": "Rademacher({-1,+1})",
         "num_probes": num_probes,
@@ -460,36 +576,74 @@ def _save_reports(
         "eps": eps,
         "device": str(device),
         "compute_dtype": str(compute_dtype).removeprefix("torch."),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
         "repair_fraction": repair_fraction,
         "selection_score": selection_score,
         "selection_rule": (
             f"highest {selection_score} scores independently per task within "
             "each layer; floor(num_experts * repair_fraction) candidates"
         ),
-        "conflict_rule": "keep_context_if_selected_by_multiple_tasks; no_backfill",
+        "conflict_rule": (
+            "shared_experts_sum_directional_deltas_of_every_selecting_task; "
+            "no_arbitration; no_backfill"
+        ),
         "expert_slot_counts": {
-            "unchanged_context": total_slots - len(repair_sources),
-            "repaired_from_target_teachers": len(repair_sources),
+            "selected_for_repair": len(selected_tasks_by_slot),
+            "copied_from_target_teachers": len(repair_sources),
             "unselected_context": total_slots - len(selected_tasks_by_slot),
-            "conflicted_kept_context": len(conflict_slots),
+            "shared_directional_repairs": len(shared_tasks),
+            "shared_all_zero_coefficients": sum(
+                all(
+                    scores_by_task[task][slot].repair_coefficient == 0.0
+                    for task in tasks
+                )
+                for slot, tasks in shared_tasks.items()
+            ),
         },
+        "shared_slot_multiplicity": {
+            str(count): sum(
+                len(tasks) == count for tasks in shared_tasks.values()
+            )
+            for count in sorted({len(tasks) for tasks in shared_tasks.values()})
+        },
+        "shared_coefficient_sums": _summarize_values(
+            [
+                sum(scores_by_task[task][slot].repair_coefficient for task in tasks)
+                for slot, tasks in shared_tasks.items()
+            ]
+        ),
         "per_task_slot_counts": {
             task: {
                 "selected_for_repair": len(slots),
-                "repaired_from_teacher": sum(
+                "copied_from_teacher": sum(
                     repair_sources.get(slot) == task for slot in slots
                 ),
-                "conflicted_kept_context": len(slots & conflict_slots),
+                "shared_directional_contribution": len(slots & shared_tasks.keys()),
             }
             for task, slots in selected_by_task.items()
         },
         "semantics": {
             "uniquely_selected_expert": "copy_complete_selecting_task_teacher_expert",
-            "multiply_selected_expert": "copy_context",
+            "multiply_selected_expert": (
+                "context_plus_summed_directional_deltas_of_all_selecting_tasks"
+            ),
             "unselected_expert": "copy_context",
             "non_expert_tensors": "copy_context",
             "scoring_context": "original_context_for_all_tasks",
+            "update_context": "original_context; no_sequential_task_updates",
+            "weight_update_dtype": "float32_accumulation_then_context_storage_dtype",
+            "gate_up_and_down": "same_coefficient_per_task_per_shared_expert",
+            "coefficient_aggregation": (
+                "sum_not_mean; each_task_delta_amplified_like_a_unique_copy"
+            ),
+            "all_zero_coefficient_shared_slot": "copy_context",
+            "slot_counts": "planned_actions; not_counts_of_changed_stored_values",
             "csv_action": "final_expert_action_shared_by_all_task_rows",
+            "csv_repair_coefficient": "per_task_coefficient; not_applied_at_unique_slots",
+            "csv_applied_repair_coefficient": (
+                "per_task_coefficient_at_shared_slots; blank_otherwise"
+            ),
         },
         "limitation": (
             "expert-local synthetic probes; routing frequency, attention, vision, "
@@ -520,6 +674,8 @@ def _save_reports(
                 "selected_for_repair",
                 "selected_by_tasks",
                 "repair_source_task",
+                "repair_coefficient",
+                "applied_repair_coefficient",
             ]
         )
         for task, scores in scores_by_task.items():
@@ -528,8 +684,9 @@ def _save_reports(
                     slot = (layout.layer_index, expert_id)
                     score = scores[slot]
                     source_task = repair_sources.get(slot)
-                    if slot in conflict_slots:
-                        action = "keep_context_conflict"
+                    shared = shared_tasks.get(slot)
+                    if shared is not None:
+                        action = "repair_shared_directional_sum"
                     elif source_task is not None:
                         action = "repair"
                     else:
@@ -551,6 +708,9 @@ def _save_reports(
                                 ensure_ascii=False,
                             ),
                             source_task if source_task is not None else "",
+                            f"{score.repair_coefficient:.17g}",
+                            (f"{score.repair_coefficient:.17g}"
+                             if shared is not None and task in shared else ""),
                         ]
                     )
 
@@ -564,7 +724,8 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Use data-free post-merge functional loss to repair target tasks' "
-            "Qwen3-VL packed MoE experts, keeping conflicting experts unchanged."
+            "Qwen3-VL packed MoE experts: copy unique teachers and apply "
+            "directional deltas to overlaps assigned by maximum I_lost."
         )
     )
     parser.add_argument("--base", required=True, help="Local base checkpoint")
@@ -574,8 +735,8 @@ def _parse_args() -> argparse.Namespace:
         dest="context_model",
         required=True,
         help=(
-            "Previously merged checkpoint to score and repair. Unselected or "
-            "conflicting experts and non-expert tensors are copied from this model"
+            "Previously merged checkpoint to score and repair. Unselected experts "
+            "and non-expert tensors are copied from this model"
         ),
     )
     parser.add_argument(
@@ -604,8 +765,8 @@ def _parse_args() -> argparse.Namespace:
         default=0.125,
         help=(
             "Highest selected-score fraction nominated independently per task "
-            "in every layer; overlapping nominations keep context weights "
-            "without backfilling (default: 0.125)"
+            "in every layer; overlaps use a directional delta from the selecting "
+            "teacher with maximum I_lost, without backfilling (default: 0.125)"
         ),
     )
     parser.add_argument(
@@ -686,7 +847,7 @@ def main() -> None:
         raise ValueError("--num-probes must be positive")
     if args.expert_batch_size <= 0:
         raise ValueError("--expert-batch-size must be positive")
-    if args.eps <= 0:
+    if not math.isfinite(args.eps) or args.eps <= 0:
         raise ValueError("--eps must be positive")
 
     base_dir = Path(args.base)
@@ -774,16 +935,23 @@ def main() -> None:
                 selection_score=args.selection_score,
             )
 
-        repair_sources, conflict_slots = resolve_repair_conflicts(selected_by_task)
+        repair_sources, shared_tasks = resolve_repair_conflicts(selected_by_task)
+        shared_coefficients = {
+            slot: tuple(
+                scores_by_task[task][slot].repair_coefficient for task in tasks
+            )
+            for slot, tasks in shared_tasks.items()
+        }
         total_slots = sum(layout.num_experts for layout in layouts)
         print(
-            f"Repair slots: repaired={len(repair_sources)}, "
-            f"conflicted_kept_context={len(conflict_slots)}, "
-            f"unchanged={total_slots - len(repair_sources)}"
+            f"Repair slots: copied_teachers={len(repair_sources)}, "
+            f"shared_directional={len(shared_tasks)}, "
+            f"unselected_context={total_slots - len(repair_sources) - len(shared_tasks)}"
         )
         print(
-            "Experts selected by multiple tasks, unselected experts, and all "
-            "non-expert tensors are copied unchanged from the context model."
+            "Unique selections copy the complete teacher expert. Shared experts "
+            "sum context + a_t * (teacher_t - base) over every selecting task. "
+            "Unselected experts and non-expert tensors retain context."
         )
 
         repaired_state = ConflictRepairCheckpoint(
@@ -791,6 +959,9 @@ def main() -> None:
             teachers,
             layouts,
             repair_sources,
+            base=base,
+            shared_tasks=shared_tasks,
+            shared_coefficients=shared_coefficients,
         )
         _save_reports(
             output_dir,
@@ -798,7 +969,7 @@ def main() -> None:
             scores_by_task=scores_by_task,
             selected_by_task=selected_by_task,
             repair_sources=repair_sources,
-            conflict_slots=conflict_slots,
+            shared_tasks=shared_tasks,
             base_dir=base_dir,
             context_dir=context_dir,
             target_teacher_dirs=target_teacher_dirs,
@@ -819,6 +990,10 @@ def main() -> None:
             save_processor=args.save_processor,
             trust_remote_code=args.trust_remote_code,
         )
+
+    with (output_dir / "repair_complete.json").open("w", encoding="utf-8") as f:
+        json.dump({"status": "complete", "repair_mode": "copy_unique_sum_shared_directional"}, f)
+        f.write("\n")
 
     print(
         f"Done. Conflict-repaired checkpoint for {', '.join(target_tasks)} "
