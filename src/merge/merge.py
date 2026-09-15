@@ -26,6 +26,10 @@ Loading strategy:
   - Read one base/teacher tensor at a time and merge it in float32.
   - Buffer only one output shard, write it directly, then save the processor.
 
+Packed Qwen experts are merged independently per expert and projection (gate,
+up, down). TIES trims each such projection separately; other tensors are trimmed
+as a whole. Output keys and packed layouts are preserved.
+
 Requires Python 3.10+ (tested with 3.12).
 """
 
@@ -162,7 +166,7 @@ class SafetensorCheckpoint:
             raise KeyError(key)
         return self.dtypes[key]
 
-    def get_tensor(self, key: str) -> torch.Tensor:
+    def _get_handle(self, key: str):
         if key not in self:
             raise KeyError(key)
         shard_name = self.weight_map[key]
@@ -176,7 +180,13 @@ class SafetensorCheckpoint:
                 )
             )
             self._handles[shard_name] = handle
-        return handle.get_tensor(key)
+        return handle
+
+    def get_tensor(self, key: str) -> torch.Tensor:
+        return self._get_handle(key).get_tensor(key)
+
+    def get_slice(self, key: str, index: tuple[slice, ...]) -> torch.Tensor:
+        return self._get_handle(key).get_slice(key)[index]
 
     def discard(self, key: str) -> None:
         if key in self.weight_map:
@@ -322,15 +332,13 @@ def merge_ta(
             scale=scale,
         )
 
-    merged: dict[str, torch.Tensor] = {}
-    for key, base_tensor in base_state_dict.items():
-        merged[key] = _merge_ta_tensor(
-            base_tensor,
-            (teacher_sd[key] for teacher_sd in teacher_state_dicts),
-            scale,
+    packed = _packed_expert_layouts(base_state_dict, teacher_state_dicts)
+    return {
+        key: _merge_state_tensor(
+            key, base_state_dict, teacher_state_dicts, "ta", scale, 1.0, packed,
         )
-
-    return merged
+        for key in base_state_dict
+    }
 
 
 def _topk_magnitude_mask(delta: torch.Tensor, density: float) -> torch.Tensor:
@@ -408,7 +416,7 @@ def merge_ties(
     """
     TIES Merging:
       1. build task vectors teacher_i - base
-      2. trim each vector to its largest-magnitude density fraction
+      2. trim each expert projection (or ordinary tensor) independently
       3. elect the dominant sign at each parameter by summing trimmed vectors
       4. average only trimmed updates that match the elected sign
       5. add scale * merged_delta back to the base model
@@ -432,16 +440,97 @@ def merge_ties(
             scale=scale,
         )
 
-    merged: dict[str, torch.Tensor] = {}
-    for key, base_tensor in base_state_dict.items():
-        merged[key] = _merge_ties_tensor(
-            base_tensor,
-            lambda key=key: (teacher_sd[key] for teacher_sd in teacher_state_dicts),
-            density,
-            scale,
+    packed = _packed_expert_layouts(base_state_dict, teacher_state_dicts)
+    return {
+        key: _merge_state_tensor(
+            key, base_state_dict, teacher_state_dicts, "ties", scale, density, packed,
         )
+        for key in base_state_dict
+    }
 
-    return merged
+
+def _packed_expert_layouts(
+    base: SafetensorCheckpoint | dict[str, torch.Tensor],
+    teachers: list[SafetensorCheckpoint | dict[str, torch.Tensor]],
+) -> dict[str, tuple[int, int, bool]]:
+    """Validate Qwen [E,H,2M]/[E,M,H] pairs before any output is written."""
+    pattern = re.compile(r"^(.*\.layers\.\d+\.mlp\.experts)\.(gate_up_proj|down_proj)$")
+    prefixes = {
+        match.group(1)
+        for key in _state_keys(base)
+        if (match := pattern.fullmatch(key))
+    }
+    layouts = {}
+    for prefix in sorted(prefixes):
+        gate_key, down_key = f"{prefix}.gate_up_proj", f"{prefix}.down_proj"
+        if gate_key not in base or down_key not in base:
+            raise ValueError(f"Missing paired Qwen expert tensor at {prefix}")
+        gate_shape, down_shape = _get_state_shape(base, gate_key), _get_state_shape(base, down_key)
+        if (len(gate_shape) != 3 or len(down_shape) != 3
+                or any(size <= 0 for size in (*gate_shape, *down_shape))
+                or gate_shape[0] != down_shape[0]
+                or gate_shape[1] != down_shape[2]
+                or gate_shape[2] != 2 * down_shape[1]):
+            raise ValueError(
+                f"Incompatible Qwen packed expert shapes at {prefix}: "
+                f"gate_up={gate_shape}, down={down_shape}"
+            )
+        for i, teacher in enumerate(teachers):
+            for key, expected in ((gate_key, gate_shape), (down_key, down_shape)):
+                if key not in teacher or _get_state_shape(teacher, key) != expected:
+                    raise ValueError(f"Teacher {i}: missing or incompatible expert tensor {key}")
+        experts, intermediate = gate_shape[0], down_shape[1]
+        layouts[gate_key] = (experts, intermediate, True)
+        layouts[down_key] = (experts, intermediate, False)
+    return layouts
+
+
+def _merge_state_tensor(
+    key: str,
+    base: SafetensorCheckpoint | dict[str, torch.Tensor],
+    teachers: list[SafetensorCheckpoint | dict[str, torch.Tensor]],
+    method: str,
+    scale: float,
+    density: float,
+    packed: dict[str, tuple[int, int, bool]],
+) -> torch.Tensor:
+    """Dispatch both in-memory and streaming merges through the same partitions."""
+    base_tensor = _get_state_tensor(base, key)
+    expected = tuple(base_tensor.shape)
+    for teacher in teachers:
+        if _get_state_shape(teacher, key) != expected:
+            raise ValueError(f"Shape mismatch at {key}: expected {expected}")
+
+    def merge_part(index: tuple[slice, ...] | None) -> torch.Tensor:
+        def teacher_parts() -> Iterable[torch.Tensor]:
+            for teacher in teachers:
+                if index is None:
+                    tensor = _get_state_tensor(teacher, key)
+                elif isinstance(teacher, SafetensorCheckpoint):
+                    tensor = teacher.get_slice(key, index)
+                else:
+                    tensor = teacher[key][index]
+                yield tensor
+                del tensor
+
+        part = base_tensor if index is None else base_tensor[index]
+        if method == "ta":
+            return _merge_ta_tensor(part, teacher_parts(), scale)
+        if method == "ties":
+            return _merge_ties_tensor(part, teacher_parts, density, scale)
+        raise ValueError(f"Unsupported merge method: {method}")
+
+    if key not in packed:
+        return merge_part(None)
+    experts, intermediate, is_gate_up = packed[key]
+    output = torch.empty_like(base_tensor)
+    for expert in range(experts):
+        for projection in range(2 if is_gate_up else 1):
+            columns = (slice(projection * intermediate, (projection + 1) * intermediate)
+                       if is_gate_up else slice(None))
+            index = (slice(expert, expert + 1), slice(None), columns)
+            output[index].copy_(merge_part(index))
+    return output
 
 
 class _StreamingMergedStateDict:
@@ -460,6 +549,7 @@ class _StreamingMergedStateDict:
         self.method = method
         self.scale = scale
         self.density = density
+        self.packed_layouts = _packed_expert_layouts(base_state_dict, teacher_state_dicts)
 
     def keys(self) -> list[str]:
         return self.base_state_dict.keys()
@@ -470,39 +560,11 @@ class _StreamingMergedStateDict:
     def get_dtype(self, key: str) -> str:
         return self.base_state_dict.get_dtype(key)
 
-    def _teacher_tensors(
-        self,
-        key: str,
-        expected_shape: tuple[int, ...],
-    ) -> Iterable[torch.Tensor]:
-        for teacher_state in self.teacher_state_dicts:
-            tensor = teacher_state.get_tensor(key)
-            if tuple(tensor.shape) != expected_shape:
-                raise ValueError(
-                    f"Shape mismatch at {key}: expected {expected_shape}, "
-                    f"got {tuple(tensor.shape)} from {teacher_state.model_dir}"
-                )
-            yield tensor
-            del tensor
-
     def get_tensor(self, key: str) -> torch.Tensor:
-        base_tensor = self.base_state_dict.get_tensor(key)
-        expected_shape = tuple(base_tensor.shape)
-
-        if self.method == "ta":
-            return _merge_ta_tensor(
-                base_tensor,
-                self._teacher_tensors(key, expected_shape),
-                self.scale,
-            )
-        if self.method == "ties":
-            return _merge_ties_tensor(
-                base_tensor,
-                lambda: self._teacher_tensors(key, expected_shape),
-                self.density,
-                self.scale,
-            )
-        raise ValueError(f"Unsupported streaming merge method: {self.method}")
+        return _merge_state_tensor(
+            key, self.base_state_dict, self.teacher_state_dicts,
+            self.method, self.scale, self.density, self.packed_layouts,
+        )
 
 
 _SAFETENSORS_DTYPE_BYTES = {
@@ -719,7 +781,8 @@ def _parse_args() -> argparse.Namespace:
         "--ties-density",
         type=float,
         default=0.2,
-        help="Fraction of largest-magnitude task-vector entries to keep for TIES (paper default: 0.2)",
+        help="Fraction of largest-magnitude task-vector entries to keep independently "
+             "per expert projection (gate/up/down), or per ordinary tensor (default: 0.2)",
     )
     parser.add_argument(
         "--scale",

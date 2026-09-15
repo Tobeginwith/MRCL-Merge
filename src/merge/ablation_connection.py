@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Ablate directional coefficients in connection-masked expert repair.
+"""Use directional connection repair with teacher-minus-context task vectors.
 
 Expert scores, selections, and teacher-minus-base connection channel masks are
 identical to merge_conflict_by_connection.py's directional branch. Only shared
 expert updates change: every selecting task contributes its masked difference
-from the ORIGINAL context, without a directional coefficient:
+from the ORIGINAL context, weighted by the original directional coefficient:
 
-    theta'_e = theta_context,e + scale * sum_t M_t,e * (theta_t,e - theta_context,e)
+    theta'_e = theta_context,e + scale * sum_t a_t,e * M_t,e * (theta_t,e - theta_context,e)
 
 Unique selections copy the complete teacher expert. Unselected experts and
 non-expert tensors retain context. There is no task-count or channel-fraction
 normalization. Differences and accumulation use FP32 with one final cast to
 context storage precision. --shared-repair-scale defaults to 1 and only affects
-shared experts. Cached directional coefficients are retained for comparison,
-but never participate in weight updates.
+shared experts. Directional coefficients are reused from full-expert scoring
+or its cache, exactly as in the original directional branch.
 
 Example:
     python src/merge/ablation_connection.py \
@@ -70,10 +70,10 @@ from src.merge.merge_conflict_by_connection import (  # noqa: E402
 )
 
 
-REPAIR_MODE = "copy_unique_sum_shared_connection_context_no_direction"
+REPAIR_MODE = "copy_unique_sum_shared_connection_context_directional"
 SHARED_WEIGHT_UPDATE = (
     "theta_context + shared_repair_scale * sum_{t in selecting_tasks} "
-    "M_t * (theta_t - theta_context)"
+    "a_t * M_t * (theta_t - theta_context)"
 )
 
 
@@ -88,17 +88,17 @@ class AblationConnectionCheckpoint(ConnectionRepairCheckpoint):
         repair_sources: dict[Slot, str],
         *,
         shared_tasks: dict[Slot, tuple[str, ...]],
+        shared_coefficients: dict[Slot, tuple[float, ...]],
         channel_selections: ChannelSelections,
         shared_repair_scale: float = 1.0,
     ) -> None:
-        # Reuse checkpoint access, mask validation, and norm reporting. The
-        # inherited constructor requires coefficients and a base; these internal
-        # placeholders are not used by the update implementation below.
+        # Reuse checkpoint access, coefficient/mask validation, and norm reporting.
+        # The update below always subtracts original context; the inherited base
+        # field is set to context for consistency with that task-vector origin.
         super().__init__(
             context, teachers, layouts, repair_sources,
             base=context, shared_tasks=shared_tasks,
-            shared_coefficients={slot: (1.0,) * len(tasks)
-                                 for slot, tasks in shared_tasks.items()},
+            shared_coefficients=shared_coefficients,
             channel_selections=channel_selections,
             shared_repair_scale=shared_repair_scale,
         )
@@ -125,7 +125,8 @@ class AblationConnectionCheckpoint(ConnectionRepairCheckpoint):
             if layer != layout.layer_index:
                 continue
             norms = self._increment_squared_norms.setdefault(slot, {})
-            if self.shared_repair_scale == 0:
+            coefficients = self.shared_coefficients[slot]
+            if self.shared_repair_scale == 0 or all(a == 0 for a in coefficients):
                 norms[key] = (0.0, 0.0)
                 continue
             # Never subtract a previously repaired value. This original context
@@ -133,11 +134,13 @@ class AblationConnectionCheckpoint(ConnectionRepairCheckpoint):
             context = output[expert_id].float()
             full_increment = torch.zeros_like(context)
             masked_increment = torch.zeros_like(context)
-            for task in tasks:
+            for task, coefficient in zip(tasks, coefficients):
+                if coefficient == 0:
+                    continue
                 teacher = self.teachers[task].get_slice(
                     key, slice(expert_id, expert_id + 1)
                 )[0].float()
-                increment = teacher - context
+                increment = coefficient * (teacher - context)
                 mask = self.channel_selections[slot][task].mask
                 expanded = (torch.cat((mask, mask))[None, :]
                             if key == layout.gate_up_key else mask[:, None])
@@ -162,7 +165,8 @@ class AblationConnectionCheckpoint(ConnectionRepairCheckpoint):
             norms[key] = (before, after)
             # Leave unmasked channels bitwise intact (including signed zeros).
             active = torch.stack([
-                self.channel_selections[slot][task].mask for task in tasks
+                self.channel_selections[slot][task].mask
+                for task, coefficient in zip(tasks, coefficients) if coefficient != 0
             ]).any(dim=0)
             if key == layout.gate_up_key:
                 output[expert_id, :, torch.cat((active, active))] = stored[:, torch.cat((active, active))]
@@ -197,7 +201,7 @@ def _save_reports(
     report = {
         "method": "data_free_multi_task_post_merge_connection_ablation",
         "repair_mode": REPAIR_MODE,
-        "coefficient_mode": "none",
+        "coefficient_mode": "directional",
         "shared_repair_scale": args.shared_repair_scale,
         "expert_scoring": scoring_info,
         "base_model": str(base_dir.resolve()),
@@ -210,7 +214,7 @@ def _save_reports(
             "I_lost": "mean_r(||f_task(z_r)-f_context(z_r)||_2^2 / (||f_task(z_r)||_2^2+eps))",
             "repair_score": "sqrt(I_task * I_lost)",
             "shared_weight_update": SHARED_WEIGHT_UPDATE,
-            "original_repair_coefficient_unused": (
+            "repair_coefficient": (
                 "clip(sum_rh((f_task-f_context)*(f_task-f_base)) / "
                 "(sum_rh((f_task-f_base)^2)+eps), 0, 1)"
             ),
@@ -228,7 +232,7 @@ def _save_reports(
         ),
         "shared_increment_norms": increment_norms,
         "increment_norm_semantics": (
-            "L2 of summed FP32 teacher-minus-context increments, jointly over gate/up/down, "
+            "L2 of summed FP32 directionally weighted teacher-minus-context increments, jointly over gate/up/down, "
             "after shared_repair_scale, before adding context or storage casting; FP64 norm reduction"
         ),
         "probe_distribution": "Rademacher({-1,+1})",
@@ -245,7 +249,7 @@ def _save_reports(
             f"highest {args.selection_score} scores independently per task within "
             "each layer; floor(num_experts * repair_fraction) candidates"
         ),
-        "conflict_rule": "sum_masked_teacher_minus_context_for_selecting_tasks; no_arbitration; no_backfill",
+        "conflict_rule": "sum_directionally_weighted_masked_teacher_minus_context_for_selecting_tasks; no_arbitration; no_backfill",
         "expert_slot_counts": {
             "selected_for_repair": len(selecting),
             "copied_from_target_teachers": len(repair_sources),
@@ -266,21 +270,22 @@ def _save_reports(
         },
         "semantics": {
             "uniquely_selected_expert": "copy_complete_selecting_task_teacher_expert; unaffected_by_scale_or_masks",
-            "multiply_selected_expert": "context_plus_scaled_sum_of_masked_teacher_minus_context",
+            "multiply_selected_expert": "context_plus_scaled_sum_of_directionally_weighted_masked_teacher_minus_context",
             "unselected_expert": "copy_context",
             "non_expert_tensors": "copy_context",
             "scoring_context": "original_context_for_all_tasks",
             "update_context": "original_context; no_sequential_task_updates",
             "weight_update_dtype": "float32_accumulation_then_context_storage_dtype",
-            "gate_up_and_down": "coupled_channel_mask_per_task_per_shared_expert",
+            "gate_up_and_down": "same_directional_coefficient_and_coupled_channel_mask_per_task_per_shared_expert",
             "aggregation": "sum_not_mean; scale_combined_increment; no_channel_fraction_normalization",
             "empty_channel_mask": "no_contribution_from_this_task",
             "channel_mask_scope": "teacher_minus_context_repair_increment_only",
             "zero_scale": "copy_context_at_shared_slots",
+            "zero_directional_coefficient": "no_contribution_from_this_task",
             "slot_counts": "planned_actions; not_counts_of_changed_stored_values",
             "csv_action": "final_expert_action_shared_by_all_task_rows",
-            "csv_repair_coefficient": "original_directional_coefficient_for_comparison_only; never_applied",
-            "csv_applied_repair_coefficient": "global_shared_repair_scale_for_selecting_tasks_at_shared_slots; blank_otherwise",
+            "csv_repair_coefficient": "original_directional_coefficient; applied_value_in_applied_repair_coefficient",
+            "csv_applied_repair_coefficient": "shared_repair_scale_times_directional_coefficient_for_selecting_tasks_at_shared_slots; blank_otherwise",
         },
         "limitation": "expert-local synthetic probes; routing frequency and real hidden-state distributions are not measured",
     }
@@ -307,7 +312,7 @@ def _save_reports(
                     channel = channel_selections.get(slot, {}).get(task)
                     source = repair_sources.get(slot)
                     shared = shared_tasks.get(slot)
-                    action = ("repair_shared_connection_context_sum" if shared is not None
+                    action = ("repair_shared_connection_context_directional_sum" if shared is not None
                               else "repair" if source is not None else "keep_context")
                     writer.writerow([
                         task, str(target_teacher_dirs[task].resolve()), layout.layer_index,
@@ -315,7 +320,8 @@ def _save_reports(
                         f"{score.geometric_mean:.17g}", action, slot in selected_by_task[task],
                         json.dumps(selecting.get(slot, []), ensure_ascii=False), source or "",
                         f"{score.repair_coefficient:.17g}",
-                        (f"{args.shared_repair_scale:.17g}" if shared is not None and task in shared else ""),
+                        (f"{args.shared_repair_scale * score.repair_coefficient:.17g}"
+                         if shared is not None and task in shared else ""),
                         len(channel.retained_ids) if channel is not None else "",
                         json.dumps(channel.retained_ids) if channel is not None else "",
                         (f"{channel.threshold:.17g}" if channel is not None and channel.threshold is not None else ""),
@@ -326,8 +332,8 @@ def _save_reports(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=(
         "Connection repair ablation: copy unique teacher experts; at shared experts, "
-        "add scale times the sum of masked teacher-minus-context deltas, without "
-        "directional coefficients. Channel selection still uses teacher-minus-base."
+        "add scale times the sum of directionally weighted masked teacher-minus-context "
+        "deltas. Channel selection still uses teacher-minus-base."
     ))
     parser.add_argument("--base", required=True, help="Local base checkpoint for scores and channel masks")
     parser.add_argument("--context-model", "--context", dest="context_model", required=True,
@@ -366,7 +372,7 @@ def _parse_args() -> argparse.Namespace:
         "and retained channel IDs before saving"
     ))
     parser.add_argument("--score-cache-dir", type=Path, help=(
-        "Reuse baseline full-expert scores and original coefficients (unused in updates). "
+        "Reuse baseline full-expert scores and directional coefficients for shared updates. "
         "Matches resolved model paths, ordered tasks, probes, seed, dtype and eps. "
         "Clear the cache if weights change at the same path"
     ))
@@ -448,6 +454,10 @@ def main() -> None:
             for task, scores in scores_by_task.items()
         }
         repair_sources, shared_tasks = resolve_repair_conflicts(selected_by_task)
+        shared_coefficients = {
+            slot: tuple(scores_by_task[task][slot].repair_coefficient for task in tasks)
+            for slot, tasks in shared_tasks.items()
+        }
         # Keep teacher-minus-base saliency unchanged for direct baseline comparison.
         channel_selections = build_channel_selections(
             base, teachers, layouts, shared_tasks, keep_fraction=args.channel_keep_fraction,
@@ -463,7 +473,8 @@ def main() -> None:
         print(f"Shared update: {SHARED_WEIGHT_UPDATE}; scale={args.shared_repair_scale}")
         repaired_state = AblationConnectionCheckpoint(
             context, teachers, layouts, repair_sources, shared_tasks=shared_tasks,
-            channel_selections=channel_selections, shared_repair_scale=args.shared_repair_scale,
+            shared_coefficients=shared_coefficients, channel_selections=channel_selections,
+            shared_repair_scale=args.shared_repair_scale,
         )
 
         # Finish validation, scoring, and reference checks before replacing outputs.
@@ -490,7 +501,7 @@ def main() -> None:
 
     with (output_dir / "repair_complete.json").open("w", encoding="utf-8") as stream:
         json.dump({"status": "complete", "repair_mode": REPAIR_MODE,
-                   "coefficient_mode": "none", "shared_repair_scale": args.shared_repair_scale}, stream)
+                   "coefficient_mode": "directional", "shared_repair_scale": args.shared_repair_scale}, stream)
         stream.write("\n")
     print(f"Done. Connection ablation for {', '.join(target_tasks)} -> {output_dir}")
 
