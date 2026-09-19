@@ -6,8 +6,9 @@ Supported methods:
   - ta: Task Arithmetic
         θ = θ_base + Σ λ_i · (θ_teacher_i − θ_base)
   - ties: TIES Merging
-  - tsvm: Task Singular Vector Merging with randomized low-rank task SVD
+  - tsvm: Task Singular Vector Merging with standard task SVD and rank truncation
   - wudi: WUDI linear-weight merging with streamed Gram statistics and Adam
+  - dc: DC-Merge (FFT), standard task SVD and TIES in shared cover space
 
 Example:
     python src/merge/merge.py ta \\
@@ -31,8 +32,8 @@ Example:
 
 TSVM follows https://arxiv.org/abs/2412.00081 and the orthogonalization variant:
 https://github.com/AntoAndGar/task_singular_vectors/blob/main/src/utils/TSVM_utils.py
-Task SVDs use randomized low-rank approximation; factor orthogonalization uses
-reduced standard SVD. Non-matrix floating tensors use the mean task delta.
+Task SVDs and factor orthogonalization use standard SVD (full_matrices=False).
+Task factors are then truncated to floor(min(m,n)/num_teachers) components. Non-matrix floating tensors use the mean task delta.
 GPU work is limited to one matrix at a time. CUDA OOM propagates to the caller.
 
 WUDI follows https://arxiv.org/abs/2503.08099 and
@@ -41,6 +42,13 @@ Use: python src/merge/merge.py wudi --base BASE --teachers T1 T2
      --device cuda:0 --wudi-steps 300 --wudi-lr 1e-5 --output OUTPUT
 Only linear weights are optimized; embeddings and other parameters retain base
 values. Packed Qwen projections are transposed to [output,input] for WUDI.
+
+DC-Merge follows https://arxiv.org/abs/2603.06242 (official FFT recipe).
+Use: python src/merge/merge.py dc --base BASE --teachers T1 T2
+     --device cuda:0 --dc-density 0.001 --scale 1.0 --output OUTPUT
+All floating matrices, including embeddings, use standard task SVD then truncation;
+cover bases use reduced standard SVD. Nonmatrix floats use mean task delta.
+No explicit LoRA energy smoothing is applied. OOM propagates without retry.
 
 Loading strategy:
   - Index safetensors metadata without loading complete checkpoints.
@@ -57,7 +65,6 @@ Requires Python 3.10+ (tested with 3.12).
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import re
@@ -487,11 +494,6 @@ def _tsvm_fp32_matmul():
             torch.set_float32_matmul_precision(previous)
 
 
-def _tsvm_seed(seed: int, identity: str, teacher_index: int) -> int:
-    message = json.dumps([seed, identity, teacher_index], ensure_ascii=False).encode("utf-8")
-    return int.from_bytes(hashlib.sha256(message).digest()[:8], "big") % (2**63)
-
-
 def _tsvm_polar(matrix: torch.Tensor) -> torch.Tensor:
     """Orthogonal Procrustes factor, including the official zero padding."""
     left, _, right = torch.linalg.svd(matrix, full_matrices=False)
@@ -506,9 +508,6 @@ def _merge_tsvm_tensor(
     num_teachers: int,
     scale: float,
     device: torch.device,
-    oversampling: int,
-    niter: int,
-    seed: int,
     identity: str,
 ) -> torch.Tensor:
     """Return CPU storage weights without modifying base or teacher tensors.
@@ -534,7 +533,6 @@ def _merge_tsvm_tensor(
         sum_u = torch.zeros((m, rank), device=device, dtype=torch.float32)
         sum_s = torch.zeros(rank, device=device, dtype=torch.float32)
         sum_vh = torch.zeros((rank, n), device=device, dtype=torch.float32)
-        q = min(rank, keep + oversampling)
     else:
         mean_delta = torch.zeros_like(base_float)
 
@@ -549,22 +547,14 @@ def _merge_tsvm_tensor(
         if not torch.isfinite(delta).all():
             raise FloatingPointError(f"Teacher {teacher_index}: non-finite FP32 task delta")
         if is_matrix:
-            # fork_rng restores CPU and only the selected CUDA device. Avoid
-            # torch.manual_seed(), which would also reseed unrelated CUDA devices.
-            devices = [device.index] if device.type == "cuda" else []
-            task_seed = _tsvm_seed(seed, identity, teacher_index)
-            with torch.random.fork_rng(devices=devices):
-                torch.random.default_generator.manual_seed(task_seed)
-                if device.type == "cuda":
-                    torch.cuda.default_generators[device.index].manual_seed(task_seed)
-                u, singular, v = torch.svd_lowrank(delta, q=q, niter=niter)
+            u, singular, vh = torch.linalg.svd(delta, full_matrices=False)
             start = teacher_index * keep
             # Copy into independent storage; sliced views must not keep full
-            # low-rank decompositions alive across teacher iterations.
+            # full SVD decompositions alive across teacher iterations.
             sum_u[:, start:start + keep].copy_(u[:, :keep])
             sum_s[start:start + keep].copy_(singular[:keep])
-            sum_vh[start:start + keep].copy_(v[:, :keep].mT)
-            del u, singular, v
+            sum_vh[start:start + keep].copy_(vh[:keep, :])
+            del u, singular, vh
         else:
             # Match the official online mean for non-matrix task vectors.
             delta.sub_(mean_delta).div_(teacher_index + 1)
@@ -595,15 +585,11 @@ def _merge_tsvm_tensor(
 class _TSVMRuntime:
     """Configuration and scalar diagnostics; never retain merged tensor weights."""
 
-    def __init__(self, *, num_teachers: int, scale: float, device: str | torch.device,
-                 oversampling: int, niter: int, seed: int):
+    def __init__(self, *, num_teachers: int, scale: float, device: str | torch.device):
         if num_teachers <= 0:
             raise ValueError("TSVM requires at least one teacher")
         if not math.isfinite(scale):
             raise ValueError("TSVM scale must be finite")
-        for name, value in (("oversampling", oversampling), ("niter", niter), ("seed", seed)):
-            if type(value) is not int or value < 0:
-                raise ValueError(f"TSVM {name} must be a nonnegative integer")
         if str(device) == "auto":
             device = "cuda:0" if torch.cuda.is_available() else "cpu"
         resolved = torch.device(device)
@@ -624,9 +610,6 @@ class _TSVMRuntime:
         self.device = resolved
         self.num_teachers = num_teachers
         self.scale = scale
-        self.oversampling = oversampling
-        self.niter = niter
-        self.seed = seed
         self.completed_parts = 0
         self.cuda_parts = 0
         self.cpu_parts = 0
@@ -641,8 +624,7 @@ class _TSVMRuntime:
         device = self.device if use_svd else torch.device("cpu")
         started = time.perf_counter()
         kwargs = dict(num_teachers=self.num_teachers, scale=self.scale,
-                      oversampling=self.oversampling, niter=self.niter,
-                      seed=self.seed, identity=identity)
+                      identity=identity)
         try:
             with _tsvm_fp32_matmul():
                 result = _merge_tsvm_tensor(
@@ -665,13 +647,11 @@ class _TSVMRuntime:
     def summary(self) -> dict:
         cuda = self.device.type == "cuda"
         return {
-            "method": "tsvm", "status": "complete", "task_svd": "randomized_lowrank",
+            "method": "tsvm", "status": "complete", "task_svd": "standard_reduced",
             "orthogonalization": "reduced_svd_procrustes",
             "num_teachers": self.num_teachers, "scale": self.scale,
             "rank_rule": "k=floor(min(m,n)/num_teachers); zero pad factors to min(m,n)",
-            "sampling_rule": "q=min(min(m,n),k+oversampling)",
-            "oversampling": self.oversampling, "niter": self.niter, "seed": self.seed,
-            "seed_rule": "sha256([seed,parameter/expert/projection,teacher_index]); isolated RNG",
+            "task_svd_full_matrices": False,
             "device": str(self.device), "compute_dtype": "float32", "tf32": False,
             "nonmatrix_rule": "base + scale * mean(teacher-base)",
             "nonfloating_rule": "copy_base", "output_dtype": "base_storage_dtype",
@@ -692,24 +672,20 @@ def merge_tsvm(
     scale: float = 1.0,
     *,
     device: str | torch.device = "auto",
-    oversampling: int = 16,
-    niter: int = 2,
-    seed: int = 42,
 ) -> _StreamingMergedStateDict | dict[str, torch.Tensor]:
-    """Merge task singular vectors with low-rank task SVD and polar whitening.
+    """Merge task singular vectors with standard task SVD and polar whitening.
 
     Matrices retain floor(min(m,n)/T) singular components per task. Ordinary
     non-matrix floating parameters use the official mean of task differences.
     Packed experts are merged separately per expert and gate/up/down projection.
     """
     runtime = _TSVMRuntime(num_teachers=len(teacher_state_dicts), scale=scale,
-                           device=device, oversampling=oversampling, niter=niter, seed=seed)
+                           device=device)
     _validate_compatible_state_dicts(
         [base_state_dict, *teacher_state_dicts],
         ["base", *(f"teacher_{i}" for i in range(len(teacher_state_dicts)))],
     )
-    print(f"TSVM device={runtime.device}; scale={scale}; oversampling={oversampling}; "
-          f"niter={niter}; seed={seed}", flush=True)
+    print(f"TSVM device={runtime.device}; scale={scale}; task_svd=standard_reduced", flush=True)
     if isinstance(base_state_dict, SafetensorCheckpoint):
         if not all(isinstance(sd, SafetensorCheckpoint) for sd in teacher_state_dicts):
             raise TypeError("Streaming TSVM requires safetensors checkpoint readers for all teachers")
@@ -934,6 +910,202 @@ def merge_wudi(
     }
 
 
+def _dc_trim(matrix: torch.Tensor, density: float) -> torch.Tensor:
+    """Official cover-space top-k threshold, including all threshold ties."""
+    k = max(1, int(density * matrix.numel()))
+    threshold = torch.topk(matrix.abs().reshape(-1), k).values.min()
+    return matrix.masked_fill(matrix.abs() < threshold, 0)
+
+
+def _dc_cover_merge(matrices: list[torch.Tensor], density: float) -> torch.Tensor:
+    """Trim full cover matrices, elect signs, average, THEN apply block mask."""
+    stacked = torch.stack([_dc_trim(matrix, density) for matrix in matrices])
+    summed = stacked.sum(dim=0)
+    aligned = stacked.sign() == summed.sign().unsqueeze(0)
+    merged = (stacked * aligned).sum(dim=0) / aligned.sum(dim=0).clamp_min(1)
+    merged.masked_fill_(summed == 0, 0)
+    del stacked, summed, aligned
+    # Preserve the official zero-padded dimensions when d % T != 0.
+    rank = merged.shape[0] // len(matrices)
+    masked = torch.zeros_like(merged)
+    for task in range(len(matrices)):
+        block = slice(task * rank, (task + 1) * rank)
+        masked[block, block].copy_(merged[block, block])
+    return masked
+
+
+@torch.inference_mode()
+def _merge_dc_tensor(
+    base_tensor: torch.Tensor,
+    teacher_tensor_factory: Callable[[], Iterable[torch.Tensor]],
+    *,
+    num_teachers: int,
+    scale: float,
+    device: torch.device,
+    density: float,
+    identity: str,
+) -> torch.Tensor:
+    """FFT DC-Merge with standard task SVD and factorized cover projection.
+
+    The official implementation reconstructs each truncated task matrix first.
+    Here M_i=(Q_U.T U_i diag(s_i)) (V_i.T Q_V) avoids those full matrices.
+    Task truncation is FFT's implicit smoothing; no LoRA smoothing is applied.
+    """
+    if (not torch.is_floating_point(base_tensor) or base_tensor.ndim != 2
+            or scale == 0 or base_tensor.numel() == 0
+            or min(base_tensor.shape) // num_teachers == 0):
+        # Identical copy/online-mean rules to TSVM, with no matrix SVD here.
+        return _merge_tsvm_tensor(
+            base_tensor, teacher_tensor_factory, num_teachers=num_teachers,
+            scale=scale, device=torch.device("cpu"), identity=identity,
+        )
+    base_float = base_tensor.to(device=device, dtype=torch.float32, copy=True)
+    if not torch.isfinite(base_tensor).all() or not torch.isfinite(base_float).all():
+        raise FloatingPointError("Non-finite base weights")
+    m, n = base_tensor.shape
+    d = min(m, n)
+    rank = d // num_teachers
+    left = torch.zeros((m, d), device=device, dtype=torch.float32)
+    right = torch.zeros((d, n), device=device, dtype=torch.float32)
+    singular = torch.zeros(d, device=device, dtype=torch.float32)
+    count = 0
+    for task, teacher_tensor in enumerate(teacher_tensor_factory()):
+        if task >= num_teachers:
+            raise ValueError("Too many teacher tensors")
+        if teacher_tensor.shape != base_tensor.shape:
+            raise ValueError(f"Teacher {task}: incompatible tensor shape")
+        delta = teacher_tensor.to(device=device, dtype=torch.float32, copy=True)
+        delta.sub_(base_float)
+        if not torch.isfinite(delta).all():
+            raise FloatingPointError(f"Teacher {task}: non-finite task delta")
+        u, s, vh = torch.linalg.svd(delta, full_matrices=False)
+        block = slice(task * rank, (task + 1) * rank)
+        left[:, block].copy_(u[:, :rank])
+        right[block, :].copy_(vh[:rank, :])
+        singular[block].copy_(s[:rank])
+        count += 1
+        del delta, teacher_tensor, u, s, vh
+    if count != num_teachers:
+        raise ValueError(f"Expected {num_teachers} teachers, got {count}")
+    if any(not torch.isfinite(value).all() for value in (left, right, singular)):
+        raise FloatingPointError("Non-finite task SVD factors")
+    cover_left = _tsvm_polar(left)
+    projected_left = cover_left.mT @ left
+    del left
+    cover_right = _tsvm_polar(right)
+    projected_right = right @ cover_right.mT
+    del right
+    matrices = []
+    for task in range(num_teachers):
+        block = slice(task * rank, (task + 1) * rank)
+        matrix = (projected_left[:, block] * singular[block]) @ projected_right[block, :]
+        if not torch.isfinite(matrix).all():
+            raise FloatingPointError(f"Teacher {task}: non-finite cover projection")
+        matrices.append(matrix)
+    del projected_left, projected_right, singular, matrix
+    merged = _dc_cover_merge(matrices, density)
+    del matrices
+    if not torch.isfinite(merged).all():
+        raise FloatingPointError("Non-finite cover-space aggregation")
+    delta = (cover_left @ merged) @ cover_right
+    del cover_left, cover_right, merged
+    base_float.add_(delta, alpha=scale)
+    del delta
+    if not torch.isfinite(base_float).all():
+        raise FloatingPointError("Non-finite DC merged weights")
+    stored = base_float.to(device="cpu", dtype=base_tensor.dtype)
+    if not torch.isfinite(stored).all():
+        raise FloatingPointError(f"DC merged weights overflow storage dtype {base_tensor.dtype}")
+    return stored
+
+
+class _DCRuntime(_TSVMRuntime):
+    """Share SVD configuration/device validation and scalar diagnostics with TSVM."""
+
+    def __init__(self, *, density: float, **kwargs):
+        if not math.isfinite(density) or not 0 < density <= 1:
+            raise ValueError("DC density must be finite and in (0, 1]")
+        try:
+            super().__init__(**kwargs)
+        except ValueError as exc:
+            exc.args = (str(exc).replace("TSVM", "DC"),)
+            raise
+        self.density = density
+
+    def merge(self, base_tensor: torch.Tensor,
+              teacher_tensor_factory: Callable[[], Iterable[torch.Tensor]],
+              identity: str) -> torch.Tensor:
+        use_svd = (torch.is_floating_point(base_tensor) and base_tensor.ndim == 2
+                   and min(base_tensor.shape) // self.num_teachers > 0 and self.scale != 0)
+        device = self.device if use_svd else torch.device("cpu")
+        started = time.perf_counter()
+        try:
+            with _tsvm_fp32_matmul():
+                result = _merge_dc_tensor(
+                    base_tensor, teacher_tensor_factory, num_teachers=self.num_teachers,
+                    scale=self.scale, device=device, density=self.density,
+                    identity=identity,
+                )
+        except torch.cuda.OutOfMemoryError as exc:
+            exc.args = (f"DC OOM at {identity}, shape={tuple(base_tensor.shape)}, "
+                        f"device={device}: {exc}",)
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"DC failed at {identity}, shape={tuple(base_tensor.shape)}, "
+                               f"device={device}: {exc}") from exc
+        self.completed_parts += 1
+        self.cuda_parts += int(device.type == "cuda")
+        self.cpu_parts += int(device.type == "cpu")
+        self.elapsed_seconds += time.perf_counter() - started
+        return result
+
+    def summary(self) -> dict:
+        report = super().summary()
+        report.update({
+            "method": "dc", "variant": "FFT", "density": self.density,
+            "smoothing": "task_svd_truncation_only", "projection": "factorized_cover_space",
+            "aggregation": "full_matrix_topk_threshold_then_mass_sign_disjoint_mean",
+            "post_aggregation_mask": "T diagonal r-by-r blocks; padded remainder zero",
+            "parameter_scope": "all floating 2D matrices including embeddings; packed expert projections",
+            "memory_statistics_scope": "PyTorch allocator peaks since DC runtime initialization",
+            "reference": "https://github.com/Tobeginwith/DC-Merge/blob/089af77a378562272461e0f041217ec440a4a230/vision_fft_merge/src/utils/DC_utils.py",
+            "paper": "https://arxiv.org/abs/2603.06242",
+        })
+        return report
+
+
+def merge_dc(
+    base_state_dict: SafetensorCheckpoint | dict[str, torch.Tensor],
+    teacher_state_dicts: list[SafetensorCheckpoint | dict[str, torch.Tensor]],
+    scale: float = 1.0,
+    *,
+    device: str | torch.device = "auto",
+    density: float = 0.001,
+) -> _StreamingMergedStateDict | dict[str, torch.Tensor]:
+    """FFT DC-Merge; nonmatrix floats use mean task delta, integers copy base."""
+    runtime = _DCRuntime(num_teachers=len(teacher_state_dicts), scale=scale,
+                         device=device, density=density)
+    _validate_compatible_state_dicts(
+        [base_state_dict, *teacher_state_dicts],
+        ["base", *(f"teacher_{i}" for i in range(len(teacher_state_dicts)))],
+    )
+    print(f"DC device={runtime.device}; scale={scale}; density={density}; "
+          "task_svd=standard_reduced", flush=True)
+    if isinstance(base_state_dict, SafetensorCheckpoint):
+        if not all(isinstance(sd, SafetensorCheckpoint) for sd in teacher_state_dicts):
+            raise TypeError("Streaming DC requires safetensors readers for all teachers")
+        return _StreamingMergedStateDict(
+            base_state_dict, teacher_state_dicts, method="dc", scale=scale, dc=runtime,
+        )
+    packed = _packed_expert_layouts(base_state_dict, teacher_state_dicts)
+    return {
+        key: _merge_state_tensor(
+            key, base_state_dict, teacher_state_dicts, "dc", scale, 1.0, packed, dc=runtime,
+        )
+        for key in base_state_dict
+    }
+
+
 def _packed_expert_layouts(
     base: SafetensorCheckpoint | dict[str, torch.Tensor],
     teachers: list[SafetensorCheckpoint | dict[str, torch.Tensor]],
@@ -981,6 +1153,7 @@ def _merge_state_tensor(
     *,
     tsvm: _TSVMRuntime | None = None,
     wudi: _WUDIRuntime | None = None,
+    dc: _DCRuntime | None = None,
 ) -> torch.Tensor:
     """Dispatch both in-memory and streaming merges through the same partitions."""
     base_tensor = _get_state_tensor(base, key)
@@ -1008,7 +1181,7 @@ def _merge_state_tensor(
                     tensor = teacher.get_slice(key, index)
                 else:
                     tensor = teacher[key][index]
-                yield tensor.squeeze(0) if method in ("tsvm", "wudi") and index is not None else tensor
+                yield tensor.squeeze(0) if method in ("tsvm", "wudi", "dc") and index is not None else tensor
                 del tensor
 
         part = base_tensor if index is None else base_tensor[index]
@@ -1016,8 +1189,8 @@ def _merge_state_tensor(
             return _merge_ta_tensor(part, teacher_parts(), scale)
         if method == "ties":
             return _merge_ties_tensor(part, teacher_parts, density, scale)
-        if method in ("tsvm", "wudi"):
-            runtime = tsvm if method == "tsvm" else wudi
+        if method in ("tsvm", "wudi", "dc"):
+            runtime = {"tsvm": tsvm, "wudi": wudi, "dc": dc}[method]
             if runtime is None:
                 raise ValueError(f"Missing {method.upper()} runtime")
             identity = key
@@ -1032,14 +1205,14 @@ def _merge_state_tensor(
             return result.unsqueeze(0) if index is not None else result
         raise ValueError(f"Unsupported merge method: {method}")
 
-    if method in ("tsvm", "wudi"):
+    if method in ("tsvm", "wudi", "dc"):
         print(f"{method.upper()} merging {key}, shape={expected}", flush=True)
     if key not in packed:
         return merge_part(None)
     experts, intermediate, is_gate_up = packed[key]
-    output = torch.empty_like(base_tensor, device="cpu") if method in ("tsvm", "wudi") else torch.empty_like(base_tensor)
+    output = torch.empty_like(base_tensor, device="cpu") if method in ("tsvm", "wudi", "dc") else torch.empty_like(base_tensor)
     for expert in range(experts):
-        if method in ("tsvm", "wudi") and expert % 16 == 0:
+        if method in ("tsvm", "wudi", "dc") and expert % 16 == 0:
             print(f"  {method.upper()} expert {expert + 1}/{experts}", flush=True)
         for projection in range(2 if is_gate_up else 1):
             columns = (slice(projection * intermediate, (projection + 1) * intermediate)
@@ -1062,6 +1235,7 @@ class _StreamingMergedStateDict:
         *,
         tsvm: _TSVMRuntime | None = None,
         wudi: _WUDIRuntime | None = None,
+        dc: _DCRuntime | None = None,
     ):
         self.base_state_dict = base_state_dict
         self.teacher_state_dicts = teacher_state_dicts
@@ -1070,6 +1244,7 @@ class _StreamingMergedStateDict:
         self.density = density
         self.tsvm = tsvm
         self.wudi = wudi
+        self.dc = dc
         self.packed_layouts = _packed_expert_layouts(base_state_dict, teacher_state_dicts)
 
     def keys(self) -> list[str]:
@@ -1084,7 +1259,7 @@ class _StreamingMergedStateDict:
     def get_tensor(self, key: str) -> torch.Tensor:
         return _merge_state_tensor(
             key, self.base_state_dict, self.teacher_state_dicts,
-            self.method, self.scale, self.density, self.packed_layouts, tsvm=self.tsvm, wudi=self.wudi,
+            self.method, self.scale, self.density, self.packed_layouts, tsvm=self.tsvm, wudi=self.wudi, dc=self.dc,
         )
 
 
@@ -1221,18 +1396,20 @@ def save_merged_model_hf(
     """Compute tensors on demand and write a sharded HF safetensors checkpoint."""
     template_dir = Path(template_dir)
     output_dir = Path(output_dir)
-    if isinstance(merged_state_dict, _StreamingMergedStateDict) and merged_state_dict.wudi is not None:
+    if (isinstance(merged_state_dict, _StreamingMergedStateDict)
+            and (merged_state_dict.wudi is not None or merged_state_dict.dc is not None)):
         _parse_size_bytes(max_shard_size)
         input_paths = [merged_state_dict.base_state_dict.model_dir,
                        *(sd.model_dir for sd in merged_state_dict.teacher_state_dicts)]
         if output_dir.resolve() in {path.resolve() for path in input_paths}:
-            raise ValueError("WUDI output directory must differ from all input checkpoints")
+            raise ValueError(f"{merged_state_dict.method.upper()} output directory must differ from all input checkpoints")
     if template_dir.resolve() == output_dir.resolve():
         raise ValueError("Output directory must differ from the base/template directory")
     output_dir.mkdir(parents=True, exist_ok=True)
     _remove_stale_safetensors(output_dir)
     (output_dir / "tsvm_merge_summary.json").unlink(missing_ok=True)
     (output_dir / "wudi_merge_summary.json").unlink(missing_ok=True)
+    (output_dir / "dc_merge_summary.json").unlink(missing_ok=True)
 
     shard_plan = _plan_output_shards(merged_state_dict, max_shard_size)
     weight_map: dict[str, str] = {}
@@ -1281,7 +1458,7 @@ def save_merged_model_hf(
     processor.save_pretrained(str(output_dir))
     print("Processor saved.")
 
-    runtime = (merged_state_dict.tsvm or merged_state_dict.wudi
+    runtime = (merged_state_dict.tsvm or merged_state_dict.wudi or merged_state_dict.dc
                if isinstance(merged_state_dict, _StreamingMergedStateDict) else None)
     if runtime is not None:
         report = runtime.summary()
@@ -1295,11 +1472,11 @@ def save_merged_model_hf(
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Merge teacher models (TA / TIES / low-rank TSVM / WUDI).")
+    parser = argparse.ArgumentParser(description="Merge teacher models (TA / TIES / TSVM / WUDI / DC-Merge).")
     parser.add_argument(
         "method",
-        choices=["ta", "ties", "tsvm", "wudi"],
-        help="ta = task arithmetic; ties = TIES merging; tsvm = low-rank task singular vector merging; wudi = WUDI linear-weight merging",
+        choices=["ta", "ties", "tsvm", "wudi", "dc"],
+        help="ta = task arithmetic; ties = TIES merging; tsvm = task singular vector merging; wudi = WUDI linear-weight merging; dc = FFT DC-Merge",
     )
     parser.add_argument(
         "--teachers",
@@ -1327,7 +1504,7 @@ def _parse_args() -> argparse.Namespace:
         "--scale",
         type=float,
         default=1.0,
-        help="Global scale applied to the summed TA task vector or merged TIES/TSVM/WUDI task vector (default: 1.0)",
+        help="Global scale applied to the summed TA task vector or merged TIES/TSVM/WUDI/DC task vector (default: 1.0)",
     )
     parser.add_argument(
         "--teacher-names",
@@ -1346,17 +1523,13 @@ def _parse_args() -> argparse.Namespace:
         help="Pass trust_remote_code to transformers (default: True)",
     )
     parser.add_argument("--device", default="auto",
-                        help="TSVM/WUDI compute device: auto, cpu, cuda:0, ... (default: auto; TA/TIES unchanged)")
-    parser.add_argument("--tsvm-oversampling", type=int, default=16,
-                        help="Extra low-rank sampling dimensions beyond each task's retained rank (default: 16)")
-    parser.add_argument("--tsvm-niter", type=int, default=2,
-                        help="Nonnegative TSVM randomized subspace iteration count (default: 2)")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Nonnegative TSVM random seed (default: 42)")
+                        help="TSVM/WUDI/DC compute device: auto, cpu, cuda:0, ... (default: auto; TA/TIES unchanged)")
     parser.add_argument("--wudi-steps", type=int, default=300,
                         help="Nonnegative WUDI Adam iteration count (default: 300)")
     parser.add_argument("--wudi-lr", type=float, default=1e-5,
                         help="Positive WUDI Adam learning rate (default: 1e-5)")
+    parser.add_argument("--dc-density", type=float, default=0.001,
+                        help="DC cover-space TIES retained fraction (default: 0.001 = 0.1%%)")
     return parser.parse_args()
 
 
@@ -1373,7 +1546,7 @@ def main() -> None:
             f"got {len(teacher_names)}."
         )
     base_path = Path(args.base)
-    if args.method in ("tsvm", "wudi"):
+    if args.method in ("tsvm", "wudi", "dc"):
         _parse_size_bytes(args.max_shard_size)
         if Path(args.output).resolve() in {base_path.resolve(), *(p.resolve() for p in teacher_paths)}:
             raise ValueError(f"{args.method.upper()} output directory must differ from all input checkpoints")
@@ -1411,6 +1584,11 @@ def main() -> None:
                 density=args.ties_density,
                 scale=args.scale,
             )
+        elif args.method == "dc":
+            merged = merge_dc(
+                base_state, teacher_states, scale=args.scale, device=args.device,
+                density=args.dc_density,
+            )
         elif args.method == "wudi":
             merged = merge_wudi(
                 base_state, teacher_states, scale=args.scale, device=args.device,
@@ -1419,7 +1597,6 @@ def main() -> None:
         else:
             merged = merge_tsvm(
                 base_state, teacher_states, scale=args.scale, device=args.device,
-                oversampling=args.tsvm_oversampling, niter=args.tsvm_niter, seed=args.seed,
             )
 
         save_merged_model_hf(
