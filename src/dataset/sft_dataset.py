@@ -131,6 +131,7 @@ class SupervisedDataset(Dataset):
         data_args: DataArguments,
         model_id,
         padding=True,
+        max_seq_length=None,
     ):
         super(SupervisedDataset, self).__init__()
         if isinstance(data_path, str):
@@ -138,6 +139,9 @@ class SupervisedDataset(Dataset):
         else:
             list_data_dict = data_path
 
+        self.max_seq_length = max_seq_length
+        if max_seq_length is not None and max_seq_length <= 0:
+            raise ValueError("max_seq_length must be positive")
         self.model_id = model_id
         self.processor = processor
         self.list_data_dict = list_data_dict
@@ -155,7 +159,7 @@ class SupervisedDataset(Dataset):
         self.nframes = data_args.nframes
         self.question_template = self._get_prompt_template(data_path)
 
-        if "Qwen3" in self.model_id:
+        if getattr(processor.image_processor, "patch_size", None) == 16 or "Qwen3" in self.model_id:
             self.image_patch_size = 16
             self.return_video_metadata = True
         else:
@@ -180,7 +184,8 @@ class SupervisedDataset(Dataset):
         sources = self.list_data_dict[i]
 
         processor = self.processor
-        if "image" in sources:
+        image_files = {}
+        if sources.get("image"):
             grid_key = "image_grid_thw"
             pixel_key = "pixel_values"
 
@@ -233,7 +238,7 @@ class SupervisedDataset(Dataset):
             
             content_list = []
             # Add all images first (before text)
-            for image_file in image_files:
+            for image_file in image_files.values():
                 content_list.append({"type": "image", "image": image_file, "min_pixels": self.image_min_pixel, "max_pixels": self.image_max_pixel})
             # Add text content
             content_list.append({"type": "text", "text": user_content_with_template})
@@ -255,7 +260,7 @@ class SupervisedDataset(Dataset):
         inputs = processor.apply_chat_template(
             prompt, tokenize=False, add_generation_prompt=False
         )
-        image_inputs, video_inputs = process_vision_info(prompt)
+        image_inputs, video_inputs = process_vision_info(prompt, image_patch_size=self.image_patch_size)
         inputs = processor(
             text=[inputs],
             images=image_inputs if image_inputs else None,
@@ -274,8 +279,9 @@ class SupervisedDataset(Dataset):
             padding=True,
             return_tensors="pt",
         )['input_ids']
-        all_pixel_values.append(inputs[pixel_key])
-        all_image_grid_thw.append(inputs[grid_key])
+        if pixel_key and grid_key:
+            all_pixel_values.append(inputs[pixel_key])
+            all_image_grid_thw.append(inputs[grid_key])
 
         response_labels = response_input_ids.squeeze(0).clone()
         input_ids = torch.cat([prompt_input_ids, response_input_ids], dim=1).squeeze(0)
@@ -294,8 +300,12 @@ class SupervisedDataset(Dataset):
         input_ids = torch.cat(all_input_ids, dim=0).to(torch.long)
         labels = torch.cat(all_labels, dim=0).to(torch.long)
 
-        # eos_token_id = processor.tokenizer.convert_tokens_to_ids(DEFAULT_IM_END_TOKEN)
-        # input_ids, labels = truncate_sequence(input_ids, labels, self.max_length, eos_token_id)
+        if self.max_seq_length is not None and input_ids.numel() > self.max_seq_length:
+            raise ValueError(
+                f"SFT sample index={i}, id={sources.get('id', 'unknown')}: "
+                f"sequence length {input_ids.numel()} exceeds max_seq_length={self.max_seq_length}; "
+                "reduce image resolution or shorten the sample (image tokens are not truncated)"
+            )
 
         attention_mask = (input_ids > -1000000).to(torch.long)
 
@@ -373,10 +383,11 @@ class DataCollatorForSupervisedDataset(object):
 
         return data_dict
 
-def make_supervised_data_module(model_id, processor, data_args):
+def make_supervised_data_module(model_id, processor, data_args, max_seq_length=None):
     """Make dataset and collator for supervised fine-tuning."""
     sft_dataset = SupervisedDataset(
-        data_path=data_args.data_path, processor=processor, data_args=data_args, model_id=model_id
+        data_path=data_args.data_path, processor=processor, data_args=data_args, model_id=model_id,
+        max_seq_length=max_seq_length
     )
     eval_dataset = None
     if data_args.eval_path is not None:
@@ -384,7 +395,8 @@ def make_supervised_data_module(model_id, processor, data_args):
               data_path=data_args.eval_path,
               processor=processor,
               data_args=data_args,
-              model_id=model_id
+              model_id=model_id,
+              max_seq_length=max_seq_length
           )
         
     data_collator = DataCollatorForSupervisedDataset(pad_token_id=processor.tokenizer.pad_token_id)

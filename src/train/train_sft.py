@@ -191,6 +191,17 @@ def train():
             **bnb_model_from_pretrained_args
         )
 
+    if config.model_type == "qwen3_vl_moe":
+        from transformers.integrations import is_deepspeed_zero3_enabled
+
+        if is_deepspeed_zero3_enabled():
+            from deepspeed.utils import set_z3_leaf_modules
+
+            leaf_modules = set_z3_leaf_modules(model, ["Qwen3VLMoeTextSparseMoeBlock"])
+            if not leaf_modules:
+                raise RuntimeError("No Qwen3-VL MoE blocks found for ZeRO-3 leaf registration")
+            rank0_print(f"Marked {len(leaf_modules)} MoE blocks as ZeRO-3 leaf modules")
+
     model.config.use_cache = False
     model_to_configure = model
     configure_llm(model_to_configure, training_args)
@@ -294,7 +305,8 @@ def train():
 
     data_module = make_supervised_data_module(model_id=model_args.model_id,
                                               processor=processor,
-                                              data_args=data_args)
+                                              data_args=data_args,
+                                              max_seq_length=training_args.max_seq_length)
 
     if training_args.use_olora:
         trainer = QwenSFTOLoRATrainer(
