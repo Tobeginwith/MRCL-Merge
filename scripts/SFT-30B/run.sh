@@ -42,8 +42,8 @@ read -ra SELECTED_TASKS <<< "${TASK_IDS:-1}"
 
 for TASK_ID in "${SELECTED_TASKS[@]}"; do
     case "$TASK_ID" in
-        1) TASK=MedBookVQA; EPOCHS=2; MIN_PIXELS=$((128*32*32)); MAX_PIXELS=$((512*32*32)) ;;
-        2) TASK=Navigation; EPOCHS=3; MIN_PIXELS=$((128*32*32)); MAX_PIXELS=$((512*32*32)) ;;
+        1) TASK=MedBookVQA; EPOCHS=1; MIN_PIXELS=$((128*32*32)); MAX_PIXELS=$((512*32*32)) ;;
+        2) TASK=Navigation; EPOCHS=2; MIN_PIXELS=$((128*32*32)); MAX_PIXELS=$((512*32*32)) ;;
         3) TASK=We-Math2; EPOCHS=1; MIN_PIXELS=$((64*32*32)); MAX_PIXELS=$((256*32*32)) ;;
         4) TASK=Puzzle; EPOCHS=1; MIN_PIXELS=$((64*32*32)); MAX_PIXELS=$((256*32*32)) ;;
         5) TASK=FinMME; EPOCHS=1; MIN_PIXELS=$((64*32*32)); MAX_PIXELS=$((256*32*32)) ;;
@@ -52,31 +52,36 @@ for TASK_ID in "${SELECTED_TASKS[@]}"; do
     OUTPUT_DIR="$CHECKPOINT_ROOT/$TASK"
     LOG_DIR="$CHECKPOINT_ROOT/logs/$TASK"
     mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
-    echo "SFT $TASK: base=$BASE_MODEL, GPUs=$NUM_GPUS, global_batch=$GLOBAL_BATCH_SIZE, accumulation=$GRAD_ACCUM_STEPS"
-    echo "Template=$PROMPT_PATH, output=$OUTPUT_DIR (existing checkpoints resume automatically)"
-    deepspeed "${LAUNCH_ARGS[@]}" \
-        "$REPO_ROOT/src/train/train_sft.py" \
-        --deepspeed "$SCRIPT_DIR/zero3_optimizer_offload.json" \
-        --model_id "$BASE_MODEL" \
-        --data_path "$BASE_PATH/$TASK/jsons/train/data.json" \
-        --image_folder "$BASE_PATH/$TASK/images" \
-        --prompt_path "$PROMPT_PATH" \
-        --output_dir "$OUTPUT_DIR" \
-        --logging_dir "$LOG_DIR/tensorboard" \
-        --use_liger_kernel False --lora_enable False \
-        --freeze_vision_tower False --freeze_llm False --freeze_merger False \
-        --bf16 True --fp16 False --tf32 True --disable_flash_attn2 False \
-        --gradient_checkpointing True \
-        --per_device_train_batch_size "$BATCH_PER_DEVICE" \
-        --gradient_accumulation_steps "$GRAD_ACCUM_STEPS" \
-        --num_train_epochs "$EPOCHS" \
-        --max_seq_length 4096 \
-        --image_min_pixels "$MIN_PIXELS" --image_max_pixels "$MAX_PIXELS" \
-        --learning_rate 5e-6 --weight_decay 0.1 \
-        --warmup_ratio 0.03 --lr_scheduler_type cosine \
-        --remove_unused_columns False --lazy_preprocess True \
-        --logging_steps 1 --report_to tensorboard \
-        --save_strategy steps --save_steps 200 --save_total_limit 2 \
-        --dataloader_num_workers 4 \
-        "$@" 2>&1 | tee "$LOG_DIR/train.log"
+    {
+        free -h || true
+        echo "SFT $TASK: base=$BASE_MODEL, GPUs=$NUM_GPUS, global_batch=$GLOBAL_BATCH_SIZE, accumulation=$GRAD_ACCUM_STEPS"
+        echo "Template=$PROMPT_PATH, output=$OUTPUT_DIR (existing checkpoints resume automatically)"
+        # Bypass console-script shebangs that may contain an old mount prefix.
+        "$CONDA_PREFIX/bin/python" -m deepspeed.launcher.runner "${LAUNCH_ARGS[@]}" \
+            "$REPO_ROOT/src/train/train_sft.py" \
+            --deepspeed "$SCRIPT_DIR/zero3_optimizer_offload.json" \
+            --model_id "$BASE_MODEL" \
+            --data_path "$BASE_PATH/$TASK/jsons/train/data.json" \
+            --image_folder "$BASE_PATH/$TASK/images" \
+            --prompt_path "$PROMPT_PATH" \
+            --output_dir "$OUTPUT_DIR" \
+            --logging_dir "$LOG_DIR/tensorboard" \
+            --use_liger_kernel False --lora_enable False \
+            --freeze_vision_tower False --freeze_llm False --freeze_merger False \
+            --bf16 True --fp16 False --tf32 True --disable_flash_attn2 False \
+            --gradient_checkpointing True \
+            --per_device_train_batch_size "$BATCH_PER_DEVICE" \
+            --gradient_accumulation_steps "$GRAD_ACCUM_STEPS" \
+            --num_train_epochs "$EPOCHS" \
+            --max_seq_length 4096 \
+            --image_min_pixels "$MIN_PIXELS" --image_max_pixels "$MAX_PIXELS" \
+            --learning_rate 5e-6 --weight_decay 0.1 \
+            --warmup_ratio 0.03 --lr_scheduler_type cosine \
+            --remove_unused_columns False --lazy_preprocess True \
+            --logging_steps 1 --report_to tensorboard \
+            --save_strategy steps --save_steps 50 --save_total_limit 2 \
+            --dataloader_num_workers 4 \
+            --dataloader_persistent_workers True \
+            "$@"
+    } 2>&1 | tee "$LOG_DIR/train.log"
 done
