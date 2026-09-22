@@ -1,8 +1,12 @@
 import os
+from functools import partial
 import torch
 import torch.nn as nn
 
 from transformers import Trainer
+from transformers.utils import is_datasets_available
+from transformers.trainer_utils import seed_worker
+from torch.utils.data import DataLoader, IterableDataset
 from transformers.trainer import (
     is_sagemaker_mp_enabled,
     get_parameter_names,
@@ -35,6 +39,61 @@ class QwenSFTTrainer(Trainer):
 
     def __init__(self, *args, **kwargs):
         super(QwenSFTTrainer, self).__init__(*args, **kwargs)
+
+    def _get_dataloader(
+        self,
+        dataset,
+        description,
+        batch_size,
+        sampler_fn=None,
+        is_training=False,
+        dataloader_key=None,
+    ):
+        context = getattr(self.args, "dataloader_multiprocessing_context", None)
+        if context is None or self.args.dataloader_num_workers == 0:
+            return super()._get_dataloader(
+                dataset, description, batch_size, sampler_fn, is_training, dataloader_key
+            )
+
+        # Match Transformers 4.57.3, adding context before Accelerate wraps the loader.
+        # Keep this local to SFT loaders; do not change the global start method.
+        data_collator = self.data_collator
+        if is_datasets_available():
+            import datasets
+
+            is_hf_dataset = isinstance(dataset, datasets.Dataset)
+        else:
+            is_hf_dataset = False
+        if is_hf_dataset:
+            dataset = self._remove_unused_columns(dataset, description=description)
+        else:
+            data_collator = self._get_collator_with_removed_columns(data_collator, description=description)
+
+        dataloader_params = {
+            "batch_size": batch_size,
+            "collate_fn": data_collator,
+            "num_workers": self.args.dataloader_num_workers,
+            "pin_memory": self.args.dataloader_pin_memory,
+            "persistent_workers": self.args.dataloader_persistent_workers,
+            "multiprocessing_context": context,
+        }
+        if not isinstance(dataset, IterableDataset):
+            if sampler_fn is not None:
+                dataloader_params["sampler"] = sampler_fn(dataset)
+            dataloader_params["drop_last"] = self.args.dataloader_drop_last
+            dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+            if is_training:
+                dataloader_params["worker_init_fn"] = partial(
+                    seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index
+                )
+
+        dataloader = self.accelerator.prepare(DataLoader(dataset, **dataloader_params))
+        if dataloader_key is not None and self.args.dataloader_persistent_workers:
+            if hasattr(self, "_eval_dataloaders"):
+                self._eval_dataloaders[dataloader_key] = dataloader
+            else:
+                self._eval_dataloaders = {dataloader_key: dataloader}
+        return dataloader
 
     def create_optimizer(self):
         """

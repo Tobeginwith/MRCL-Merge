@@ -8,6 +8,7 @@ Supported methods:
   - ties: TIES Merging
   - tsvm: Task Singular Vector Merging with standard task SVD and rank truncation
   - wudi: WUDI linear-weight merging with streamed Gram statistics and Adam
+  - iso_c: Isotropic Merging in Common Subspace (Iso-C)
   - dc: DC-Merge (FFT), standard task SVD and TIES in shared cover space
 
 Example:
@@ -49,6 +50,15 @@ Use: python src/merge/merge.py dc --base BASE --teachers T1 T2
 All floating matrices, including embeddings, use standard task SVD then truncation;
 cover bases use reduced standard SVD. Nonmatrix floats use mean task delta.
 No explicit LoRA energy smoothing is applied. OOM propagates without retry.
+
+Iso-C follows https://arxiv.org/abs/2502.04959 and
+https://github.com/danielm1405/iso-merging/blob/main/src/utils/iso.py
+Use: python src/merge/merge.py iso_c --base BASE --teachers T1 T2
+     --device cuda:0 --scale 1.0 --output OUTPUT
+All floating matrices (including text_projection) use the summed task matrix's
+reduced SVD, replacing every singular value by their mean, without truncation.
+Nonmatrix floats use the CPU mean task delta, as in TSVM/DC. Matrix computation
+requires CUDA; OOM propagates without retry or CPU fallback.
 
 Loading strategy:
   - Index safetensors metadata without loading complete checkpoints.
@@ -1106,6 +1116,148 @@ def merge_dc(
     }
 
 
+@torch.inference_mode()
+def _merge_iso_c_tensor(
+    base_tensor: torch.Tensor,
+    teacher_tensor_factory: Callable[[], Iterable[torch.Tensor]],
+    *,
+    num_teachers: int,
+    scale: float,
+    device: torch.device,
+    identity: str,
+) -> torch.Tensor:
+    """Flatten the spectrum of the summed task matrix, without rank truncation."""
+    if (not torch.is_floating_point(base_tensor) or base_tensor.ndim != 2
+            or scale == 0 or base_tensor.numel() == 0):
+        return _merge_tsvm_tensor(
+            base_tensor, teacher_tensor_factory, num_teachers=num_teachers,
+            scale=scale, device=torch.device("cpu"), identity=identity,
+        )
+    base_float = base_tensor.to(device=device, dtype=torch.float32, copy=True)
+    if not torch.isfinite(base_tensor).all() or not torch.isfinite(base_float).all():
+        raise FloatingPointError("Non-finite base weights")
+    combined = torch.zeros_like(base_float)
+    count = 0
+    for task, teacher_tensor in enumerate(teacher_tensor_factory()):
+        if task >= num_teachers:
+            raise ValueError("Too many teacher tensors")
+        if teacher_tensor.shape != base_tensor.shape:
+            raise ValueError(f"Teacher {task}: incompatible tensor shape")
+        delta = teacher_tensor.to(device=device, dtype=torch.float32, copy=True)
+        delta.sub_(base_float)
+        if not torch.isfinite(delta).all():
+            raise FloatingPointError(f"Teacher {task}: non-finite task delta")
+        combined.add_(delta)
+        count += 1
+        del delta, teacher_tensor
+    if count != num_teachers:
+        raise ValueError(f"Expected {num_teachers} teachers, got {count}")
+    if not torch.isfinite(combined).all():
+        raise FloatingPointError("Non-finite summed task matrix")
+    u, singular, vh = torch.linalg.svd(combined, full_matrices=False)
+    del combined
+    # Keep every reduced-SVD component, including zero singular values.
+    u.mul_(singular.mean())
+    delta = u @ vh
+    del u, singular, vh
+    base_float.add_(delta, alpha=scale)
+    del delta
+    if not torch.isfinite(base_float).all():
+        raise FloatingPointError("Non-finite Iso-C merged weights")
+    stored = base_float.to(device="cpu", dtype=base_tensor.dtype)
+    if not torch.isfinite(stored).all():
+        raise FloatingPointError(f"Iso-C merged weights overflow storage dtype {base_tensor.dtype}")
+    return stored
+
+
+class _IsoCRuntime(_TSVMRuntime):
+    """Reuse SVD runtime diagnostics; matrix computation requires CUDA."""
+
+    def __init__(self, **kwargs):
+        device = kwargs.get("device", "auto")
+        resolved = torch.device("cuda:0" if str(device) == "auto" else device)
+        if resolved.type != "cuda":
+            raise ValueError("Iso-C requires a CUDA device for matrix merging")
+        if resolved.index is not None and not 0 <= resolved.index < torch.cuda.device_count():
+            raise ValueError(f"Invalid Iso-C CUDA device index: {resolved.index}")
+        kwargs["device"] = resolved
+        try:
+            super().__init__(**kwargs)
+        except ValueError as exc:
+            exc.args = (str(exc).replace("TSVM", "Iso-C"),)
+            raise
+
+    def merge(self, base_tensor: torch.Tensor,
+              teacher_tensor_factory: Callable[[], Iterable[torch.Tensor]],
+              identity: str) -> torch.Tensor:
+        use_svd = (torch.is_floating_point(base_tensor) and base_tensor.ndim == 2
+                   and base_tensor.numel() > 0 and self.scale != 0)
+        device = self.device if use_svd else torch.device("cpu")
+        started = time.perf_counter()
+        try:
+            with _tsvm_fp32_matmul():
+                result = _merge_iso_c_tensor(
+                    base_tensor, teacher_tensor_factory, num_teachers=self.num_teachers,
+                    scale=self.scale, device=device, identity=identity,
+                )
+        except torch.cuda.OutOfMemoryError as exc:
+            exc.args = (f"Iso-C OOM at {identity}, shape={tuple(base_tensor.shape)}, "
+                        f"device={device}: {exc}",)
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Iso-C failed at {identity}, shape={tuple(base_tensor.shape)}, "
+                               f"device={device}: {exc}") from exc
+        self.completed_parts += 1
+        self.cuda_parts += int(device.type == "cuda")
+        self.cpu_parts += int(device.type == "cpu")
+        self.elapsed_seconds += time.perf_counter() - started
+        return result
+
+    def summary(self) -> dict:
+        report = super().summary()
+        for key in ("task_svd", "task_svd_full_matrices", "orthogonalization", "rank_rule"):
+            del report[key]
+        report.update({
+            "method": "iso_c", "svd_input": "sum(teacher-base)",
+            "svd_full_matrices": False, "spectrum": "mean of all reduced singular values",
+            "rank_rule": "all min(m,n) components; no truncation",
+            "parameter_scope": "all floating 2D matrices; packed expert projections",
+            "memory_statistics_scope": "PyTorch allocator peaks since Iso-C runtime initialization",
+            "reference": "https://github.com/danielm1405/iso-merging/blob/main/src/utils/iso.py",
+            "paper": "https://arxiv.org/abs/2502.04959",
+        })
+        return report
+
+
+def merge_iso_c(
+    base_state_dict: SafetensorCheckpoint | dict[str, torch.Tensor],
+    teacher_state_dicts: list[SafetensorCheckpoint | dict[str, torch.Tensor]],
+    scale: float = 1.0,
+    *,
+    device: str | torch.device = "auto",
+) -> _StreamingMergedStateDict | dict[str, torch.Tensor]:
+    """Iso-C on every floating matrix; other floats use the CPU mean task delta."""
+    runtime = _IsoCRuntime(num_teachers=len(teacher_state_dicts), scale=scale, device=device)
+    _validate_compatible_state_dicts(
+        [base_state_dict, *teacher_state_dicts],
+        ["base", *(f"teacher_{i}" for i in range(len(teacher_state_dicts)))],
+    )
+    print(f"Iso-C device={runtime.device}; scale={scale}; summed-task SVD", flush=True)
+    if isinstance(base_state_dict, SafetensorCheckpoint):
+        if not all(isinstance(sd, SafetensorCheckpoint) for sd in teacher_state_dicts):
+            raise TypeError("Streaming Iso-C requires safetensors readers for all teachers")
+        return _StreamingMergedStateDict(
+            base_state_dict, teacher_state_dicts, method="iso_c", scale=scale, iso_c=runtime,
+        )
+    packed = _packed_expert_layouts(base_state_dict, teacher_state_dicts)
+    return {
+        key: _merge_state_tensor(
+            key, base_state_dict, teacher_state_dicts, "iso_c", scale, 1.0, packed, iso_c=runtime,
+        )
+        for key in base_state_dict
+    }
+
+
 def _packed_expert_layouts(
     base: SafetensorCheckpoint | dict[str, torch.Tensor],
     teachers: list[SafetensorCheckpoint | dict[str, torch.Tensor]],
@@ -1154,6 +1306,7 @@ def _merge_state_tensor(
     tsvm: _TSVMRuntime | None = None,
     wudi: _WUDIRuntime | None = None,
     dc: _DCRuntime | None = None,
+    iso_c: _IsoCRuntime | None = None,
 ) -> torch.Tensor:
     """Dispatch both in-memory and streaming merges through the same partitions."""
     base_tensor = _get_state_tensor(base, key)
@@ -1181,7 +1334,7 @@ def _merge_state_tensor(
                     tensor = teacher.get_slice(key, index)
                 else:
                     tensor = teacher[key][index]
-                yield tensor.squeeze(0) if method in ("tsvm", "wudi", "dc") and index is not None else tensor
+                yield tensor.squeeze(0) if method in ("tsvm", "wudi", "dc", "iso_c") and index is not None else tensor
                 del tensor
 
         part = base_tensor if index is None else base_tensor[index]
@@ -1189,8 +1342,8 @@ def _merge_state_tensor(
             return _merge_ta_tensor(part, teacher_parts(), scale)
         if method == "ties":
             return _merge_ties_tensor(part, teacher_parts, density, scale)
-        if method in ("tsvm", "wudi", "dc"):
-            runtime = {"tsvm": tsvm, "wudi": wudi, "dc": dc}[method]
+        if method in ("tsvm", "wudi", "dc", "iso_c"):
+            runtime = {"tsvm": tsvm, "wudi": wudi, "dc": dc, "iso_c": iso_c}[method]
             if runtime is None:
                 raise ValueError(f"Missing {method.upper()} runtime")
             identity = key
@@ -1205,14 +1358,14 @@ def _merge_state_tensor(
             return result.unsqueeze(0) if index is not None else result
         raise ValueError(f"Unsupported merge method: {method}")
 
-    if method in ("tsvm", "wudi", "dc"):
+    if method in ("tsvm", "wudi", "dc", "iso_c"):
         print(f"{method.upper()} merging {key}, shape={expected}", flush=True)
     if key not in packed:
         return merge_part(None)
     experts, intermediate, is_gate_up = packed[key]
-    output = torch.empty_like(base_tensor, device="cpu") if method in ("tsvm", "wudi", "dc") else torch.empty_like(base_tensor)
+    output = torch.empty_like(base_tensor, device="cpu") if method in ("tsvm", "wudi", "dc", "iso_c") else torch.empty_like(base_tensor)
     for expert in range(experts):
-        if method in ("tsvm", "wudi", "dc") and expert % 16 == 0:
+        if method in ("tsvm", "wudi", "dc", "iso_c") and expert % 16 == 0:
             print(f"  {method.upper()} expert {expert + 1}/{experts}", flush=True)
         for projection in range(2 if is_gate_up else 1):
             columns = (slice(projection * intermediate, (projection + 1) * intermediate)
@@ -1236,6 +1389,7 @@ class _StreamingMergedStateDict:
         tsvm: _TSVMRuntime | None = None,
         wudi: _WUDIRuntime | None = None,
         dc: _DCRuntime | None = None,
+        iso_c: _IsoCRuntime | None = None,
     ):
         self.base_state_dict = base_state_dict
         self.teacher_state_dicts = teacher_state_dicts
@@ -1245,6 +1399,7 @@ class _StreamingMergedStateDict:
         self.tsvm = tsvm
         self.wudi = wudi
         self.dc = dc
+        self.iso_c = iso_c
         self.packed_layouts = _packed_expert_layouts(base_state_dict, teacher_state_dicts)
 
     def keys(self) -> list[str]:
@@ -1259,7 +1414,7 @@ class _StreamingMergedStateDict:
     def get_tensor(self, key: str) -> torch.Tensor:
         return _merge_state_tensor(
             key, self.base_state_dict, self.teacher_state_dicts,
-            self.method, self.scale, self.density, self.packed_layouts, tsvm=self.tsvm, wudi=self.wudi, dc=self.dc,
+            self.method, self.scale, self.density, self.packed_layouts, tsvm=self.tsvm, wudi=self.wudi, dc=self.dc, iso_c=self.iso_c,
         )
 
 
@@ -1397,7 +1552,8 @@ def save_merged_model_hf(
     template_dir = Path(template_dir)
     output_dir = Path(output_dir)
     if (isinstance(merged_state_dict, _StreamingMergedStateDict)
-            and (merged_state_dict.wudi is not None or merged_state_dict.dc is not None)):
+            and (merged_state_dict.wudi is not None or merged_state_dict.dc is not None
+                 or merged_state_dict.iso_c is not None)):
         _parse_size_bytes(max_shard_size)
         input_paths = [merged_state_dict.base_state_dict.model_dir,
                        *(sd.model_dir for sd in merged_state_dict.teacher_state_dicts)]
@@ -1410,6 +1566,7 @@ def save_merged_model_hf(
     (output_dir / "tsvm_merge_summary.json").unlink(missing_ok=True)
     (output_dir / "wudi_merge_summary.json").unlink(missing_ok=True)
     (output_dir / "dc_merge_summary.json").unlink(missing_ok=True)
+    (output_dir / "iso_c_merge_summary.json").unlink(missing_ok=True)
 
     shard_plan = _plan_output_shards(merged_state_dict, max_shard_size)
     weight_map: dict[str, str] = {}
@@ -1458,7 +1615,7 @@ def save_merged_model_hf(
     processor.save_pretrained(str(output_dir))
     print("Processor saved.")
 
-    runtime = (merged_state_dict.tsvm or merged_state_dict.wudi or merged_state_dict.dc
+    runtime = (merged_state_dict.tsvm or merged_state_dict.wudi or merged_state_dict.dc or merged_state_dict.iso_c
                if isinstance(merged_state_dict, _StreamingMergedStateDict) else None)
     if runtime is not None:
         report = runtime.summary()
@@ -1472,11 +1629,11 @@ def save_merged_model_hf(
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Merge teacher models (TA / TIES / TSVM / WUDI / DC-Merge).")
+    parser = argparse.ArgumentParser(description="Merge teacher models (TA / TIES / TSVM / WUDI / DC-Merge / Iso-C).")
     parser.add_argument(
         "method",
-        choices=["ta", "ties", "tsvm", "wudi", "dc"],
-        help="ta = task arithmetic; ties = TIES merging; tsvm = task singular vector merging; wudi = WUDI linear-weight merging; dc = FFT DC-Merge",
+        choices=["ta", "ties", "tsvm", "wudi", "dc", "iso_c"],
+        help="ta = task arithmetic; ties = TIES merging; tsvm = task singular vector merging; wudi = WUDI linear-weight merging; dc = FFT DC-Merge; iso_c = isotropic common-subspace merging",
     )
     parser.add_argument(
         "--teachers",
@@ -1504,7 +1661,7 @@ def _parse_args() -> argparse.Namespace:
         "--scale",
         type=float,
         default=1.0,
-        help="Global scale applied to the summed TA task vector or merged TIES/TSVM/WUDI/DC task vector (default: 1.0)",
+        help="Global scale applied to the summed TA task vector or merged TIES/TSVM/WUDI/DC/Iso-C task vector (default: 1.0)",
     )
     parser.add_argument(
         "--teacher-names",
@@ -1523,7 +1680,7 @@ def _parse_args() -> argparse.Namespace:
         help="Pass trust_remote_code to transformers (default: True)",
     )
     parser.add_argument("--device", default="auto",
-                        help="TSVM/WUDI/DC compute device: auto, cpu, cuda:0, ... (default: auto; TA/TIES unchanged)")
+                        help="TSVM/WUDI/DC/Iso-C compute device: auto, cpu, cuda:0, ... (default: auto; Iso-C requires CUDA for matrices; TA/TIES unchanged)")
     parser.add_argument("--wudi-steps", type=int, default=300,
                         help="Nonnegative WUDI Adam iteration count (default: 300)")
     parser.add_argument("--wudi-lr", type=float, default=1e-5,
@@ -1546,7 +1703,7 @@ def main() -> None:
             f"got {len(teacher_names)}."
         )
     base_path = Path(args.base)
-    if args.method in ("tsvm", "wudi", "dc"):
+    if args.method in ("tsvm", "wudi", "dc", "iso_c"):
         _parse_size_bytes(args.max_shard_size)
         if Path(args.output).resolve() in {base_path.resolve(), *(p.resolve() for p in teacher_paths)}:
             raise ValueError(f"{args.method.upper()} output directory must differ from all input checkpoints")
@@ -1583,6 +1740,10 @@ def main() -> None:
                 teacher_states,
                 density=args.ties_density,
                 scale=args.scale,
+            )
+        elif args.method == "iso_c":
+            merged = merge_iso_c(
+                base_state, teacher_states, scale=args.scale, device=args.device,
             )
         elif args.method == "dc":
             merged = merge_dc(

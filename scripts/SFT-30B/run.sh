@@ -82,6 +82,7 @@ for TASK_ID in "${SELECTED_TASKS[@]}"; do
             --save_strategy steps --save_steps 50 --save_total_limit 2 \
             --dataloader_num_workers 4 \
             --dataloader_persistent_workers True \
+            --dataloader_multiprocessing_context spawn \
             "$@"
     } 2>&1 | tee "$LOG_DIR/train.log"
 done

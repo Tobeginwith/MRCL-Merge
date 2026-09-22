@@ -104,6 +104,9 @@ for TEST_DATASET in "${SELECTED_DATASETS[@]}"; do
         --output_dir "$RESULTS_DIR" \
         --prompts_file src/dataset/prompts_2.yaml \
         --max_completion_length 2048 \
+        --temperature 1.0 \
+        --top_p 1.0 \
+        --repetition_penalty 1.05 \
         --tensor_parallel_size "$CHUNKS" \
         --batch_size "$BATCH_SIZE" \
         "${FLASH_ATTN_FLAG[@]}"

@@ -180,7 +180,10 @@ class VLMInference:
         disable_flash_attn2: bool = False,
         batch_size: int = 1,
         prompt_config: Dict = None,
-        max_completion_length: int = 2048
+        max_completion_length: int = 2048,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.05
     ):
         self.base_model_path = base_model_path
         self.test_file = test_file
@@ -211,10 +214,10 @@ class VLMInference:
         
         # Configure sampling.
         self.sampling_params = SamplingParams(
-            temperature=1.0,
-            top_p=1.0,
+            temperature=temperature,
+            top_p=top_p,
             max_tokens=self.max_completion_length,
-            repetition_penalty=1.05
+            repetition_penalty=repetition_penalty
         )
     
     def _init_chat_tokenizer(self, base_model_path):
@@ -603,6 +606,9 @@ def main():
     parser.add_argument('--output_dir', type=str, required=True)
     parser.add_argument('--prompts_file', type=str, required=True)
     parser.add_argument('--max_completion_length', type=int, required=True)
+    parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature; 0 enables greedy decoding')
+    parser.add_argument('--top_p', type=float, default=1.0, help='Nucleus sampling probability threshold')
+    parser.add_argument('--repetition_penalty', type=float, default=1.05, help='Repetition penalty')
     parser.add_argument('--tensor_parallel_size', type=int, default=1)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--disable_flash_attn2', action='store_true', help='Disable Flash Attention 2 and use SDPA instead')
@@ -622,7 +628,10 @@ def main():
         disable_flash_attn2=args.disable_flash_attn2,
         batch_size=args.batch_size,
         prompt_config=prompt_config,
-        max_completion_length=args.max_completion_length
+        max_completion_length=args.max_completion_length,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty
     )
 
     datasets_parquet = [

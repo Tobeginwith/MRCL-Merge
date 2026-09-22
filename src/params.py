@@ -24,6 +24,13 @@ class ModelArguments:
 @dataclass
 class TrainingArguments(HFTrainingArguments):
     cache_dir: Optional[str] = field(default=None)
+    dataloader_multiprocessing_context: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "SFT DataLoader worker start method; unset preserves the platform default.",
+            "choices": ["spawn", "forkserver", "fork"],
+        },
+    )
     optim: str = field(default="adamw_torch")
     adam_beta1: float = field(default=0.9)
     adam_beta2: float = field(default=0.999)
