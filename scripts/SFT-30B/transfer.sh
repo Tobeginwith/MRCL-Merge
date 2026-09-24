@@ -40,10 +40,22 @@ copy_for_vllm() {
 }
 
 # Final checkpoints from the completed one-epoch runs.
-copy_for_vllm \
-    "$SOURCE_ROOT/MedBookVQA/checkpoint-172" \
-    "$BASE/Qwen3-VL-30B-A3B-Instruct-MedVQA-SFTEpoch1"
+# copy_for_vllm \
+#     "$SOURCE_ROOT/MedBookVQA/checkpoint-172" \
+#     "$BASE/Qwen3-VL-30B-A3B-Instruct-MedVQA-SFTEpoch1"
+
+# copy_for_vllm \
+#     "$SOURCE_ROOT/Navigation/checkpoint-364" \
+#     "$BASE/Qwen3-VL-30B-A3B-Instruct-Navigation-SFTEpoch2"
+
+# copy_for_vllm \
+#     "$SOURCE_ROOT/We-Math2/checkpoint-716" \
+#     "$BASE/Qwen3-VL-30B-A3B-Instruct-WeMath2-SFTEpoch1"
 
 copy_for_vllm \
-    "$SOURCE_ROOT/Navigation/checkpoint-182" \
-    "$BASE/Qwen3-VL-30B-A3B-Instruct-Navigation-SFTEpoch1"
+    "$SOURCE_ROOT/Puzzle/checkpoint-750" \
+    "$BASE/Qwen3-VL-30B-A3B-Instruct-Puzzle-SFTEpoch1"
+
+copy_for_vllm \
+    "$SOURCE_ROOT/FinMME/checkpoint-1005" \
+    "$BASE/Qwen3-VL-30B-A3B-Instruct-FinMME-SFTEpoch1"
