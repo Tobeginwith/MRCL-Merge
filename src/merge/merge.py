@@ -8,6 +8,7 @@ Supported methods:
   - ties: TIES Merging
   - tsvm: Task Singular Vector Merging with randomized low-rank task SVD and rank truncation
   - wudi: WUDI linear-weight merging with streamed Gram statistics and Adam
+  - ram_plus: RAM+ with global overlap-aware unique update scaling
   - iso_c: Isotropic Merging in Common Subspace (Iso-C)
   - dc: DC-Merge (FFT), randomized low-rank task SVD and TIES in shared cover space
 
@@ -61,6 +62,16 @@ All floating matrices (including text_projection) use the summed task matrix's
 reduced SVD, replacing every singular value by their mean, without truncation.
 Nonmatrix floats use the CPU mean task delta, as in TSVM/DC. Matrix computation
 requires CUDA; OOM propagates without retry or CPU fallback.
+
+RAM+ follows the official arm-r-v2 code (not the paper's different scaling rule):
+https://github.com/xiangchi-yuan/mrl/blob/main/ram-main.py
+Use: python src/merge/merge.py ram_plus --base BASE --teachers T1 T2
+     --device cuda:0 --ram-threshold 1e-5 --ram-rescale-factor 1.2 --output OUTPUT
+All floating tensors use active-only averaging in shared regions and task-specific
+scaling in unique regions. Global shared/unique counts determine each scale as
+1 + (max(1,rescale_factor)-1) * min(shared/unique,1). With no unique updates,
+the ratio is 1 if shared updates exist, otherwise 0. Statistics and merging run
+on CUDA in separate streaming passes. OOM propagates without CPU fallback.
 
 Loading strategy:
   - Index safetensors metadata without loading complete checkpoints.
@@ -1283,6 +1294,226 @@ def merge_iso_c(
     }
 
 
+def _expert_part_indices(layout: tuple[int, int, bool]) -> Iterable[tuple[slice, ...]]:
+    experts, intermediate, is_gate_up = layout
+    for expert in range(experts):
+        for projection in range(2 if is_gate_up else 1):
+            columns = (slice(projection * intermediate, (projection + 1) * intermediate)
+                       if is_gate_up else slice(None))
+            yield (slice(expert, expert + 1), slice(None), columns)
+
+
+def _teacher_parts(teachers, key: str, index: tuple[slice, ...] | None,
+                   squeeze: bool = False) -> Iterable[torch.Tensor]:
+    for teacher in teachers:
+        if index is None:
+            tensor = _get_state_tensor(teacher, key)
+        elif isinstance(teacher, SafetensorCheckpoint):
+            tensor = teacher.get_slice(key, index)
+        else:
+            tensor = teacher[key][index]
+        yield tensor.squeeze(0) if squeeze and index is not None else tensor
+        del tensor
+
+
+class _RAMPlusRuntime(_TSVMRuntime):
+    """Global RAM+ counts and scales; never retain checkpoint tensors or masks."""
+
+    def __init__(self, *, num_teachers: int, scale: float, device: str | torch.device,
+                 threshold: float, rescale_factor: float):
+        if not math.isfinite(threshold) or threshold < 0:
+            raise ValueError("RAM+ threshold must be finite and nonnegative")
+        if not math.isfinite(rescale_factor):
+            raise ValueError("RAM+ rescale_factor must be finite")
+        resolved = torch.device("cuda:0" if str(device) == "auto" else device)
+        if resolved.type != "cuda":
+            raise ValueError("RAM+ requires a CUDA device")
+        if resolved.index is not None and not 0 <= resolved.index < torch.cuda.device_count():
+            raise ValueError(f"Invalid RAM+ CUDA device index: {resolved.index}")
+        try:
+            super().__init__(num_teachers=num_teachers, scale=scale, device=resolved)
+        except ValueError as exc:
+            exc.args = (str(exc).replace("TSVM", "RAM+"),)
+            raise
+        self.threshold = threshold
+        self.requested_rescale_factor = rescale_factor
+        self.rescale_factor = max(1.0, rescale_factor)
+        self.shared_counts = [0] * num_teachers
+        self.unique_counts = [0] * num_teachers
+        self.rescales = [1.0] * num_teachers
+        self.statistics_complete = False
+        self.statistics_parts = 0
+        self.statistics_seconds = 0.0
+
+    def _deltas(self, base_float, shape, teacher_tensor_factory):
+        count = 0
+        for task, tensor in enumerate(teacher_tensor_factory()):
+            if task >= self.num_teachers or tuple(tensor.shape) != shape:
+                raise ValueError(f"Teacher {task}: incompatible tensor count or shape")
+            delta = tensor.to(device=self.device, dtype=torch.float32, copy=True)
+            delta.sub_(base_float)
+            if not torch.isfinite(delta).all():
+                raise FloatingPointError(f"Teacher {task}: non-finite FP32 task delta")
+            active = delta.abs() > self.threshold
+            yield task, delta, active
+            count += 1
+            del tensor, delta, active
+        if count != self.num_teachers:
+            raise ValueError(f"Expected {self.num_teachers} teachers, got {count}")
+
+    @torch.inference_mode()
+    def _compute(self, base_tensor, teacher_tensor_factory, *, probing: bool):
+        if not torch.is_floating_point(base_tensor):
+            return None if probing else base_tensor.detach().to(device="cpu", copy=True)
+        if not torch.isfinite(base_tensor).all():
+            raise FloatingPointError("Non-finite base weights")
+        if self.scale == 0 or base_tensor.numel() == 0:
+            return None if probing else base_tensor.detach().to(device="cpu", copy=True)
+        base_float = base_tensor.to(device=self.device, dtype=torch.float32, copy=True)
+        if not torch.isfinite(base_float).all():
+            raise FloatingPointError("Non-finite FP32 base weights")
+        shape = tuple(base_tensor.shape)
+        counts = torch.zeros(shape, device=self.device, dtype=torch.int64)
+        if probing:
+            for _, delta, active in self._deltas(base_float, shape, teacher_tensor_factory):
+                counts.add_(active)
+                del delta, active
+            # Reread teachers instead of retaining N masks for this parameter.
+            for task, delta, active in self._deltas(base_float, shape, teacher_tensor_factory):
+                self.shared_counts[task] += int((active & (counts >= 2)).sum().item())
+                self.unique_counts[task] += int((active & (counts == 1)).sum().item())
+                del delta, active
+            return None
+        summed = torch.zeros_like(base_float)
+        weighted = torch.zeros_like(base_float)
+        for task, delta, active in self._deltas(base_float, shape, teacher_tensor_factory):
+            counts.add_(active)
+            delta.masked_fill_(~active, 0)
+            summed.add_(delta)
+            weighted.add_(delta, alpha=self.rescales[task])
+            del delta, active
+        if not torch.isfinite(summed).all() or not torch.isfinite(weighted).all():
+            raise FloatingPointError("Non-finite RAM+ accumulated task delta")
+        summed.div_(counts.clamp_min(1))
+        merged = torch.where(counts == 1, weighted, summed)
+        base_float.add_(merged, alpha=self.scale)
+        if not torch.isfinite(base_float).all():
+            raise FloatingPointError("Non-finite RAM+ merged weights")
+        stored = base_float.to(device="cpu", dtype=base_tensor.dtype)
+        if not torch.isfinite(stored).all():
+            raise FloatingPointError(f"RAM+ weights overflow storage dtype {base_tensor.dtype}")
+        return stored
+
+    def _run(self, base_tensor, teacher_tensor_factory, identity: str, *, probing: bool):
+        stage = "statistics" if probing else "merge"
+        started = time.perf_counter()
+        try:
+            result = self._compute(base_tensor, teacher_tensor_factory, probing=probing)
+        except torch.cuda.OutOfMemoryError as exc:
+            exc.args = (f"RAM+ OOM during {stage} at {identity}, "
+                        f"shape={tuple(base_tensor.shape)}, device={self.device}: {exc}",)
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"RAM+ failed during {stage} at {identity}, "
+                               f"shape={tuple(base_tensor.shape)}, device={self.device}: {exc}") from exc
+        elapsed = time.perf_counter() - started
+        if probing:
+            self.statistics_parts += 1
+            self.statistics_seconds += elapsed
+        else:
+            self.completed_parts += 1
+            self.elapsed_seconds += elapsed
+        return result
+
+    def probe(self, base_tensor, teacher_tensor_factory, identity: str) -> None:
+        self._run(base_tensor, teacher_tensor_factory, identity, probing=True)
+
+    def finish_statistics(self) -> None:
+        for task, (shared, unique) in enumerate(zip(self.shared_counts, self.unique_counts)):
+            ratio = min(shared / unique, 1.0) if unique else float(shared > 0)
+            self.rescales[task] = 1.0 + (self.rescale_factor - 1.0) * ratio
+        self.statistics_complete = True
+        print(f"RAM+ global shared={self.shared_counts}; unique={self.unique_counts}; "
+              f"rescales={self.rescales}", flush=True)
+
+    def merge(self, base_tensor, teacher_tensor_factory, identity: str) -> torch.Tensor:
+        if not self.statistics_complete:
+            raise RuntimeError("RAM+ requires completed global statistics before merging")
+        return self._run(base_tensor, teacher_tensor_factory, identity, probing=False)
+
+    def summary(self) -> dict:
+        return {
+            "method": "ram_plus", "variant": "official_arm_r_v2", "status": "complete",
+            "num_teachers": self.num_teachers, "scale": self.scale,
+            "threshold": self.threshold, "requested_rescale_factor": self.requested_rescale_factor,
+            "rescale_factor": self.rescale_factor,
+            "rescale_rule": "1 + (max(1,rescale_factor)-1) * min(shared/unique,1)",
+            "zero_unique_rule": "ratio=1 if shared>0 else 0",
+            "statistics_scope": "all aligned floating parameters, global per teacher",
+            "statistics_skipped": self.scale == 0,
+            "shared_counts": self.shared_counts, "unique_counts": self.unique_counts,
+            "rescales": self.rescales, "device": str(self.device), "compute_dtype": "float32",
+            "output_dtype": "base_storage_dtype", "nonfloating_rule": "copy_base",
+            "statistics_parts": self.statistics_parts, "completed_parts": self.completed_parts,
+            "statistics_seconds": self.statistics_seconds,
+            "elapsed_compute_seconds": self.elapsed_seconds,
+            "cuda_peak_allocated_bytes": torch.cuda.max_memory_allocated(self.device),
+            "cuda_peak_reserved_bytes": torch.cuda.max_memory_reserved(self.device),
+            "memory_statistics_scope": "PyTorch allocator peaks since RAM+ runtime initialization",
+            "torch_version": torch.__version__, "cuda_version": torch.version.cuda,
+            "reference": "https://github.com/xiangchi-yuan/mrl/blob/main/ram-main.py",
+            "paper": "https://aclanthology.org/2026.acl-long.1524.pdf",
+        }
+
+
+def merge_ram_plus(
+    base_state_dict: SafetensorCheckpoint | dict[str, torch.Tensor],
+    teacher_state_dicts: list[SafetensorCheckpoint | dict[str, torch.Tensor]],
+    scale: float = 1.0,
+    *,
+    device: str | torch.device = "auto",
+    threshold: float = 1e-5,
+    rescale_factor: float = 1.2,
+) -> _StreamingMergedStateDict | dict[str, torch.Tensor]:
+    """Official RAM+ scaling using global overlap/unique counts, on CUDA."""
+    runtime = _RAMPlusRuntime(num_teachers=len(teacher_state_dicts), scale=scale,
+                             device=device, threshold=threshold, rescale_factor=rescale_factor)
+    _validate_compatible_state_dicts(
+        [base_state_dict, *teacher_state_dicts],
+        ["base", *(f"teacher_{i}" for i in range(len(teacher_state_dicts)))],
+    )
+    if isinstance(base_state_dict, SafetensorCheckpoint) and not all(
+            isinstance(sd, SafetensorCheckpoint) for sd in teacher_state_dicts):
+        raise TypeError("Streaming RAM+ requires safetensors readers for all teachers")
+    packed = _packed_expert_layouts(base_state_dict, teacher_state_dicts)
+    if scale != 0:
+        print(f"RAM+ global statistics on {runtime.device} ...", flush=True)
+        for key in _state_keys(base_state_dict):
+            base_tensor = _get_state_tensor(base_state_dict, key)
+            print(f"RAM+ statistics {key}, shape={tuple(base_tensor.shape)}", flush=True)
+            indices = _expert_part_indices(packed[key]) if key in packed else (None,)
+            for index in indices:
+                part = base_tensor if index is None else base_tensor[index].squeeze(0)
+                identity = key
+                if index is not None:
+                    name = ("gate" if index[2].start == 0 else "up") if packed[key][2] else "down"
+                    identity = f"{key}/expert={index[0].start}/projection={name}"
+                runtime.probe(part, lambda: _teacher_parts(teacher_state_dicts, key, index, True), identity)
+                del part
+            del base_tensor
+    runtime.finish_statistics()
+    if isinstance(base_state_dict, SafetensorCheckpoint):
+        return _StreamingMergedStateDict(
+            base_state_dict, teacher_state_dicts, method="ram_plus", scale=scale, ram_plus=runtime,
+        )
+    return {
+        key: _merge_state_tensor(
+            key, base_state_dict, teacher_state_dicts, "ram_plus", scale, 1.0, packed, ram_plus=runtime,
+        )
+        for key in base_state_dict
+    }
+
+
 def _packed_expert_layouts(
     base: SafetensorCheckpoint | dict[str, torch.Tensor],
     teachers: list[SafetensorCheckpoint | dict[str, torch.Tensor]],
@@ -1332,6 +1563,7 @@ def _merge_state_tensor(
     wudi: _WUDIRuntime | None = None,
     dc: _DCRuntime | None = None,
     iso_c: _IsoCRuntime | None = None,
+    ram_plus: _RAMPlusRuntime | None = None,
 ) -> torch.Tensor:
     """Dispatch both in-memory and streaming merges through the same partitions."""
     base_tensor = _get_state_tensor(base, key)
@@ -1352,23 +1584,16 @@ def _merge_state_tensor(
 
     def merge_part(index: tuple[slice, ...] | None) -> torch.Tensor:
         def teacher_parts() -> Iterable[torch.Tensor]:
-            for teacher in teachers:
-                if index is None:
-                    tensor = _get_state_tensor(teacher, key)
-                elif isinstance(teacher, SafetensorCheckpoint):
-                    tensor = teacher.get_slice(key, index)
-                else:
-                    tensor = teacher[key][index]
-                yield tensor.squeeze(0) if method in ("tsvm", "wudi", "dc", "iso_c") and index is not None else tensor
-                del tensor
+            return _teacher_parts(teachers, key, index,
+                                  method in ("tsvm", "wudi", "dc", "iso_c", "ram_plus"))
 
         part = base_tensor if index is None else base_tensor[index]
         if method == "ta":
             return _merge_ta_tensor(part, teacher_parts(), scale)
         if method == "ties":
             return _merge_ties_tensor(part, teacher_parts, density, scale)
-        if method in ("tsvm", "wudi", "dc", "iso_c"):
-            runtime = {"tsvm": tsvm, "wudi": wudi, "dc": dc, "iso_c": iso_c}[method]
+        if method in ("tsvm", "wudi", "dc", "iso_c", "ram_plus"):
+            runtime = {"tsvm": tsvm, "wudi": wudi, "dc": dc, "iso_c": iso_c, "ram_plus": ram_plus}[method]
             if runtime is None:
                 raise ValueError(f"Missing {method.upper()} runtime")
             identity = key
@@ -1383,20 +1608,18 @@ def _merge_state_tensor(
             return result.unsqueeze(0) if index is not None else result
         raise ValueError(f"Unsupported merge method: {method}")
 
-    if method in ("tsvm", "wudi", "dc", "iso_c"):
+    if method in ("tsvm", "wudi", "dc", "iso_c", "ram_plus"):
         print(f"{method.upper()} merging {key}, shape={expected}", flush=True)
     if key not in packed:
         return merge_part(None)
     experts, intermediate, is_gate_up = packed[key]
-    output = torch.empty_like(base_tensor, device="cpu") if method in ("tsvm", "wudi", "dc", "iso_c") else torch.empty_like(base_tensor)
-    for expert in range(experts):
-        if method in ("tsvm", "wudi", "dc", "iso_c") and expert % 16 == 0:
+    output = torch.empty_like(base_tensor, device="cpu") if method in ("tsvm", "wudi", "dc", "iso_c", "ram_plus") else torch.empty_like(base_tensor)
+    for index in _expert_part_indices(packed[key]):
+        expert = index[0].start
+        if (method in ("tsvm", "wudi", "dc", "iso_c", "ram_plus") and expert % 16 == 0
+                and (not is_gate_up or index[2].start == 0)):
             print(f"  {method.upper()} expert {expert + 1}/{experts}", flush=True)
-        for projection in range(2 if is_gate_up else 1):
-            columns = (slice(projection * intermediate, (projection + 1) * intermediate)
-                       if is_gate_up else slice(None))
-            index = (slice(expert, expert + 1), slice(None), columns)
-            output[index].copy_(merge_part(index))
+        output[index].copy_(merge_part(index))
     return output
 
 
@@ -1415,6 +1638,7 @@ class _StreamingMergedStateDict:
         wudi: _WUDIRuntime | None = None,
         dc: _DCRuntime | None = None,
         iso_c: _IsoCRuntime | None = None,
+        ram_plus: _RAMPlusRuntime | None = None,
     ):
         self.base_state_dict = base_state_dict
         self.teacher_state_dicts = teacher_state_dicts
@@ -1425,6 +1649,7 @@ class _StreamingMergedStateDict:
         self.wudi = wudi
         self.dc = dc
         self.iso_c = iso_c
+        self.ram_plus = ram_plus
         self.packed_layouts = _packed_expert_layouts(base_state_dict, teacher_state_dicts)
 
     def keys(self) -> list[str]:
@@ -1439,7 +1664,7 @@ class _StreamingMergedStateDict:
     def get_tensor(self, key: str) -> torch.Tensor:
         return _merge_state_tensor(
             key, self.base_state_dict, self.teacher_state_dicts,
-            self.method, self.scale, self.density, self.packed_layouts, tsvm=self.tsvm, wudi=self.wudi, dc=self.dc, iso_c=self.iso_c,
+            self.method, self.scale, self.density, self.packed_layouts, tsvm=self.tsvm, wudi=self.wudi, dc=self.dc, iso_c=self.iso_c, ram_plus=self.ram_plus,
         )
 
 
@@ -1578,7 +1803,7 @@ def save_merged_model_hf(
     output_dir = Path(output_dir)
     if (isinstance(merged_state_dict, _StreamingMergedStateDict)
             and (merged_state_dict.wudi is not None or merged_state_dict.dc is not None
-                 or merged_state_dict.iso_c is not None)):
+                 or merged_state_dict.iso_c is not None or merged_state_dict.ram_plus is not None)):
         _parse_size_bytes(max_shard_size)
         input_paths = [merged_state_dict.base_state_dict.model_dir,
                        *(sd.model_dir for sd in merged_state_dict.teacher_state_dicts)]
@@ -1592,6 +1817,7 @@ def save_merged_model_hf(
     (output_dir / "wudi_merge_summary.json").unlink(missing_ok=True)
     (output_dir / "dc_merge_summary.json").unlink(missing_ok=True)
     (output_dir / "iso_c_merge_summary.json").unlink(missing_ok=True)
+    (output_dir / "ram_plus_merge_summary.json").unlink(missing_ok=True)
 
     shard_plan = _plan_output_shards(merged_state_dict, max_shard_size)
     weight_map: dict[str, str] = {}
@@ -1640,7 +1866,7 @@ def save_merged_model_hf(
     processor.save_pretrained(str(output_dir))
     print("Processor saved.")
 
-    runtime = (merged_state_dict.tsvm or merged_state_dict.wudi or merged_state_dict.dc or merged_state_dict.iso_c
+    runtime = (merged_state_dict.tsvm or merged_state_dict.wudi or merged_state_dict.dc or merged_state_dict.iso_c or merged_state_dict.ram_plus
                if isinstance(merged_state_dict, _StreamingMergedStateDict) else None)
     if runtime is not None:
         report = runtime.summary()
@@ -1654,11 +1880,11 @@ def save_merged_model_hf(
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Merge teacher models (TA / TIES / TSVM / WUDI / DC-Merge / Iso-C).")
+    parser = argparse.ArgumentParser(description="Merge teacher models (TA / TIES / TSVM / WUDI / DC-Merge / Iso-C / RAM+).")
     parser.add_argument(
         "method",
-        choices=["ta", "ties", "tsvm", "wudi", "dc", "iso_c"],
-        help="ta = task arithmetic; ties = TIES merging; tsvm = task singular vector merging; wudi = WUDI linear-weight merging; dc = FFT DC-Merge; iso_c = isotropic common-subspace merging",
+        choices=["ta", "ties", "tsvm", "wudi", "dc", "iso_c", "ram_plus"],
+        help="ta = task arithmetic; ties = TIES merging; tsvm = task singular vector merging; wudi = WUDI linear-weight merging; dc = FFT DC-Merge; iso_c = isotropic common-subspace merging; ram_plus = reinforced agent merging",
     )
     parser.add_argument(
         "--teachers",
@@ -1686,7 +1912,7 @@ def _parse_args() -> argparse.Namespace:
         "--scale",
         type=float,
         default=1.0,
-        help="Global scale applied to the summed TA task vector or merged TIES/TSVM/WUDI/DC/Iso-C task vector (default: 1.0)",
+        help="Global scale applied to the summed TA task vector or merged TIES/TSVM/WUDI/DC/Iso-C/RAM+ task vector (default: 1.0)",
     )
     parser.add_argument(
         "--teacher-names",
@@ -1705,7 +1931,11 @@ def _parse_args() -> argparse.Namespace:
         help="Pass trust_remote_code to transformers (default: True)",
     )
     parser.add_argument("--device", default="auto",
-                        help="TSVM/WUDI/DC/Iso-C compute device: auto, cpu, cuda:0, ... (default: auto; Iso-C requires CUDA for matrices; TA/TIES unchanged)")
+                        help="TSVM/WUDI/DC/Iso-C/RAM+ compute device: auto, cpu, cuda:0, ... (default: auto; Iso-C requires CUDA for matrices; RAM+ requires CUDA; TA/TIES unchanged)")
+    parser.add_argument("--ram-threshold", type=float, default=1e-5,
+                        help="RAM+ active update threshold, nonnegative (default: 1e-5)")
+    parser.add_argument("--ram-rescale-factor", type=float, default=1.2,
+                        help="RAM+ unique update rescale bound; values <=1 mean RAM (default: 1.2)")
     parser.add_argument("--niter", type=int, default=4,
                         help="TSVM/DC task low-rank SVD subspace iterations, nonnegative (default: 4)")
     parser.add_argument("--oversampling", type=int, default=8,
@@ -1732,7 +1962,7 @@ def main() -> None:
             f"got {len(teacher_names)}."
         )
     base_path = Path(args.base)
-    if args.method in ("tsvm", "wudi", "dc", "iso_c"):
+    if args.method in ("tsvm", "wudi", "dc", "iso_c", "ram_plus"):
         _parse_size_bytes(args.max_shard_size)
         if Path(args.output).resolve() in {base_path.resolve(), *(p.resolve() for p in teacher_paths)}:
             raise ValueError(f"{args.method.upper()} output directory must differ from all input checkpoints")
@@ -1769,6 +1999,11 @@ def main() -> None:
                 teacher_states,
                 density=args.ties_density,
                 scale=args.scale,
+            )
+        elif args.method == "ram_plus":
+            merged = merge_ram_plus(
+                base_state, teacher_states, scale=args.scale, device=args.device,
+                threshold=args.ram_threshold, rescale_factor=args.ram_rescale_factor,
             )
         elif args.method == "iso_c":
             merged = merge_iso_c(
