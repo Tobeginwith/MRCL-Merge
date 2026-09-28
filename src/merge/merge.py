@@ -8,7 +8,9 @@ Supported methods:
   - ties: TIES Merging
   - tsvm: Task Singular Vector Merging with randomized low-rank task SVD and rank truncation
   - wudi: WUDI linear-weight merging with streamed Gram statistics and Adam
+  - orthomerge_g: OrthoMerge-G with TA residual merging
   - ram_plus: RAM+ with global overlap-aware unique update scaling
+  - iso_cts: Isotropic Merging in Common and Task-Specific Subspaces
   - iso_c: Isotropic Merging in Common Subspace (Iso-C)
   - dc: DC-Merge (FFT), randomized low-rank task SVD and TIES in shared cover space
 
@@ -63,6 +65,12 @@ reduced SVD, replacing every singular value by their mean, without truncation.
 Nonmatrix floats use the CPU mean task delta, as in TSVM/DC. Matrix computation
 requires CUDA; OOM propagates without retry or CPU fallback.
 
+Iso-CTS uses standard SVD for the summed common space and whitening, and
+randomized low-rank SVD for the projected task-specific spaces. It follows
+the same parameter scope and nonmatrix mean rule as Iso-C.
+Use: python src/merge/merge.py iso_cts --base BASE --teachers T1 T2
+     --output OUT --iso-cts-common-space-fraction 0.8 --niter 4 --oversampling 8
+
 RAM+ follows the official arm-r-v2 code (not the paper's different scaling rule):
 https://github.com/xiangchi-yuan/mrl/blob/main/ram-main.py
 Use: python src/merge/merge.py ram_plus --base BASE --teachers T1 T2
@@ -73,10 +81,24 @@ scaling in unique regions. Global shared/unique counts determine each scale as
 the ratio is 1 if shared updates exist, otherwise 0. Statistics and merging run
 on CUDA in separate streaming passes. OOM propagates without CPU fallback.
 
+OrthoMerge-G + TA follows https://arxiv.org/abs/2602.05943 and
+https://github.com/Sphere-AI-Lab/OrthoMerge/blob/main/merge/OrthoMerge_G_TA.py
+Use: python src/merge/merge.py orthomerge_g --base BASE --teachers T1 T2
+     --device cuda:0 --scale 0.5 --output OUTPUT
+All floating matrices use right Procrustes rotations in [output,input] layout,
+inverse Cayley mapping, and magnitude-corrected merging. Scale applies ONLY to
+the summed residuals; 1/num_teachers averages them, and scale=0 retains rotation.
+Nonmatrix floats use TA (summed task deltas). All floating computation uses CUDA
+FP32. Standard SVD and solve failures propagate, including OOM, without fallback.
+
 Loading strategy:
   - Index safetensors metadata without loading complete checkpoints.
   - Read one base/teacher tensor at a time and merge it in float32.
   - Buffer only one output shard, write it directly, then save the processor.
+
+TA/TIES default to cuda:0 (including nonmatrix arithmetic); use --device cpu
+for explicit CPU computation. CUDA OOM propagates without fallback. Both
+return CPU storage tensors and retain the existing streaming save pipeline.
 
 Packed Qwen experts are merged independently per expert and projection (gate,
 up, down). TIES trims each such projection separately; other tensors are trimmed
@@ -353,29 +375,54 @@ def _validate_compatible_state_dicts(
                 )
 
 
+def _resolve_ta_ties_device(device: str | torch.device) -> torch.device:
+    """Default to CUDA; CPU is available only when explicitly requested."""
+    resolved = torch.device("cuda:0" if str(device) == "auto" else device)
+    if resolved.type == "cpu":
+        if resolved.index is not None:
+            raise ValueError("TA/TIES require cpu without a device index")
+        return resolved
+    if resolved.type != "cuda":
+        raise ValueError("TA/TIES device must be auto, cpu, or a CUDA device")
+    if not torch.cuda.is_available():
+        raise ValueError("TA/TIES requested CUDA, but CUDA is unavailable; use --device cpu explicitly")
+    index = torch.cuda.current_device() if resolved.index is None else resolved.index
+    if not 0 <= index < torch.cuda.device_count():
+        raise ValueError(f"Invalid TA/TIES CUDA device index: {index}")
+    resolved = torch.device("cuda", index)
+    torch.cuda.get_device_properties(resolved)
+    return resolved
+
+
 def _merge_ta_tensor(
     base_tensor: torch.Tensor,
     teacher_tensors: Iterable[torch.Tensor],
     scale: float,
+    *,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
-    base_float = base_tensor.to(dtype=torch.float32, copy=True)
+    base_float = base_tensor.to(device=device, dtype=torch.float32, copy=True)
     merged_delta = torch.zeros_like(base_float)
     for teacher_tensor in teacher_tensors:
-        delta = teacher_tensor.to(dtype=torch.float32, copy=True)
+        delta = teacher_tensor.to(device=device, dtype=torch.float32, copy=True)
         delta.sub_(base_float)
         merged_delta.add_(delta)
         del delta, teacher_tensor
     base_float.add_(merged_delta, alpha=scale)
     del merged_delta
-    return base_float.to(base_tensor.dtype)
+    return base_float.to(device="cpu", dtype=base_tensor.dtype)
 
 
 def merge_ta(
     base_state_dict: SafetensorCheckpoint | dict[str, torch.Tensor],
     teacher_state_dicts: list[SafetensorCheckpoint | dict[str, torch.Tensor]],
     scale: float = 1.0,
+    *,
+    device: str | torch.device = "auto",
 ) -> _StreamingMergedStateDict | dict[str, torch.Tensor]:
     """Apply standard Task Arithmetic to every tensor."""
+    compute_device = _resolve_ta_ties_device(device)
+    print(f"TA compute device={compute_device}", flush=True)
     if isinstance(base_state_dict, SafetensorCheckpoint):
         if not all(isinstance(sd, SafetensorCheckpoint) for sd in teacher_state_dicts):
             raise TypeError("Streaming TA requires safetensors checkpoint readers for all teachers")
@@ -384,12 +431,13 @@ def merge_ta(
             teacher_state_dicts,
             method="ta",
             scale=scale,
+            compute_device=compute_device,
         )
 
     packed = _packed_expert_layouts(base_state_dict, teacher_state_dicts)
     return {
         key: _merge_state_tensor(
-            key, base_state_dict, teacher_state_dicts, "ta", scale, 1.0, packed,
+            key, base_state_dict, teacher_state_dicts, "ta", scale, 1.0, packed, compute_device=compute_device,
         )
         for key in base_state_dict
     }
@@ -416,16 +464,18 @@ def _merge_ties_tensor(
     teacher_tensor_factory: Callable[[], Iterable[torch.Tensor]],
     density: float,
     scale: float,
+    *,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     if not torch.is_floating_point(base_tensor):
-        return base_tensor.clone()
+        return base_tensor.detach().to(device="cpu", copy=True)
 
-    base_float = base_tensor.to(dtype=torch.float32, copy=True)
+    base_float = base_tensor.to(device=device, dtype=torch.float32, copy=True)
     sign_votes = torch.zeros_like(base_float)
 
     # First pass: trim each task vector and elect the dominant sign.
     for teacher_tensor in teacher_tensor_factory():
-        delta = teacher_tensor.to(dtype=torch.float32, copy=True)
+        delta = teacher_tensor.to(device=device, dtype=torch.float32, copy=True)
         delta.sub_(base_float)
         trim_mask = _topk_magnitude_mask(delta, density)
         delta.masked_fill_(~trim_mask, 0.0)
@@ -439,7 +489,7 @@ def _merge_ties_tensor(
 
     # Second pass: reread one teacher tensor at a time and reduce aligned updates.
     for teacher_tensor in teacher_tensor_factory():
-        delta = teacher_tensor.to(dtype=torch.float32, copy=True)
+        delta = teacher_tensor.to(device=device, dtype=torch.float32, copy=True)
         delta.sub_(base_float)
         trim_mask = _topk_magnitude_mask(delta, density)
         aligned_mask = (
@@ -458,7 +508,7 @@ def _merge_ties_tensor(
     aligned_sum.div_(aligned_count)
     base_float.add_(aligned_sum, alpha=scale)
     del aligned_sum, aligned_count, elected_sign
-    return base_float.to(base_tensor.dtype)
+    return base_float.to(device="cpu", dtype=base_tensor.dtype)
 
 
 def merge_ties(
@@ -466,6 +516,8 @@ def merge_ties(
     teacher_state_dicts: list[SafetensorCheckpoint | dict[str, torch.Tensor]],
     density: float = 0.2,
     scale: float = 1.0,
+    *,
+    device: str | torch.device = "auto",
 ) -> _StreamingMergedStateDict | dict[str, torch.Tensor]:
     """
     TIES Merging:
@@ -481,6 +533,8 @@ def merge_ties(
     """
     if not 0.0 < density <= 1.0:
         raise ValueError(f"ties density must be in (0, 1], got {density}")
+    compute_device = _resolve_ta_ties_device(device)
+    print(f"TIES compute device={compute_device}", flush=True)
     if isinstance(base_state_dict, SafetensorCheckpoint):
         if not all(isinstance(sd, SafetensorCheckpoint) for sd in teacher_state_dicts):
             raise TypeError(
@@ -492,12 +546,13 @@ def merge_ties(
             method="ties",
             density=density,
             scale=scale,
+            compute_device=compute_device,
         )
 
     packed = _packed_expert_layouts(base_state_dict, teacher_state_dicts)
     return {
         key: _merge_state_tensor(
-            key, base_state_dict, teacher_state_dicts, "ties", scale, density, packed,
+            key, base_state_dict, teacher_state_dicts, "ties", scale, density, packed, compute_device=compute_device,
         )
         for key in base_state_dict
     }
@@ -1294,6 +1349,367 @@ def merge_iso_c(
     }
 
 
+def _iso_cts_dimensions(rank: int, num_teachers: int, fraction: float) -> tuple[int, int]:
+    """Official nearest allocation, capped to keep the common dimension nonnegative."""
+    per_task = min(rank // num_teachers, round((rank - int(rank * fraction)) / num_teachers))
+    return rank - num_teachers * per_task, per_task
+
+
+class _IsoCTSRuntime(_IsoCRuntime):
+    """Stream common and task-specific subspaces without retaining task matrices."""
+
+    def __init__(self, *, common_space_fraction: float = 0.8, **kwargs):
+        if not math.isfinite(common_space_fraction) or not 0 <= common_space_fraction <= 1:
+            raise ValueError("Iso-CTS common_space_fraction must be finite and in [0, 1]")
+        try:
+            super().__init__(**kwargs)
+        except ValueError as exc:
+            exc.args = (str(exc).replace("Iso-C", "Iso-CTS"),)
+            raise
+        self.common_space_fraction = common_space_fraction
+        self.stage = "initialization"
+
+    @torch.inference_mode()
+    def _compute(self, base_tensor, teacher_tensor_factory, identity):
+        self.stage = "nonmatrix or identity merge"
+        if (not torch.is_floating_point(base_tensor) or base_tensor.ndim != 2
+                or self.scale == 0 or base_tensor.numel() == 0):
+            return _merge_iso_c_tensor(
+                base_tensor, teacher_tensor_factory, num_teachers=self.num_teachers,
+                scale=self.scale, device=torch.device("cpu"), identity=identity,
+            )
+        m, n = base_tensor.shape
+        rank = min(m, n)
+        common, per_task = _iso_cts_dimensions(rank, self.num_teachers, self.common_space_fraction)
+        if per_task == 0:
+            self.stage = "common-only Iso-C"
+            return _merge_iso_c_tensor(
+                base_tensor, teacher_tensor_factory, num_teachers=self.num_teachers,
+                scale=self.scale, device=self.device, identity=identity,
+            )
+        self.stage = "base conversion"
+        base = base_tensor.to(device=self.device, dtype=torch.float32, copy=True)
+        if not torch.isfinite(base).all():
+            raise FloatingPointError("Non-finite FP32 base weights")
+
+        def deltas(pass_name):
+            count = 0
+            for task, tensor in enumerate(teacher_tensor_factory()):
+                self.stage = f"{pass_name} teacher {task} conversion"
+                if task >= self.num_teachers or tensor.shape != base_tensor.shape:
+                    raise ValueError(f"Teacher {task}: incompatible tensor count or shape")
+                delta = tensor.to(device=self.device, dtype=torch.float32, copy=True)
+                delta.sub_(base)
+                if not torch.isfinite(delta).all():
+                    raise FloatingPointError("Non-finite FP32 task delta")
+                yield task, delta
+                count += 1
+                del delta, tensor
+            if count != self.num_teachers:
+                raise ValueError(f"Expected {self.num_teachers} teachers, got {count}")
+
+        combined = torch.zeros_like(base)
+        for _, delta in deltas("common"):
+            combined.add_(delta)
+            del delta
+        self.stage = "common SVD"
+        if not torch.isfinite(combined).all():
+            raise FloatingPointError("Non-finite summed task matrix")
+        u, singular, vh = torch.linalg.svd(combined, full_matrices=False)
+        del combined
+        common_u = u[:, :common].clone()
+        left = torch.empty((m, rank), device=self.device, dtype=torch.float32)
+        right = torch.empty((rank, n), device=self.device, dtype=torch.float32)
+        values = torch.empty(rank, device=self.device, dtype=torch.float32)
+        offset = self.num_teachers * per_task
+        left[:, offset:].copy_(common_u)
+        right[offset:, :].copy_(vh[:common, :])
+        values[offset:].copy_(singular[:common])
+        del u, singular, vh
+        for task, delta in deltas("specific"):
+            self.stage = f"teacher {task} common projection"
+            if common:
+                delta.sub_(common_u @ (common_u.mT @ delta))
+            if not torch.isfinite(delta).all():
+                raise FloatingPointError("Non-finite projected task matrix")
+            self.stage = f"teacher {task} low-rank SVD"
+            u, singular, v = torch.svd_lowrank(
+                delta, q=min(per_task + self.oversampling, rank), niter=self.niter,
+            )
+            block = slice(task * per_task, (task + 1) * per_task)
+            left[:, block].copy_(u[:, :per_task])
+            right[block, :].copy_(v[:, :per_task].mT)
+            values[block].copy_(singular[:per_task])
+            del delta, u, singular, v
+        del common_u
+        self.stage = "factor validation"
+        if any(not torch.isfinite(x).all() for x in (left, right, values)):
+            raise FloatingPointError("Non-finite selected SVD factors")
+        self.stage = "left whitening SVD"
+        left = _tsvm_polar(left)
+        self.stage = "right whitening SVD"
+        right = _tsvm_polar(right)
+        self.stage = "isotropic reconstruction"
+        left.mul_(values.mean())
+        result = left @ right
+        base.add_(result, alpha=self.scale)
+        if not torch.isfinite(base).all():
+            raise FloatingPointError("Non-finite Iso-CTS merged weights")
+        self.stage = "output conversion"
+        stored = base.to(device="cpu", dtype=base_tensor.dtype)
+        if not torch.isfinite(stored).all():
+            raise FloatingPointError(f"Iso-CTS weights overflow storage dtype {base_tensor.dtype}")
+        return stored
+
+    def merge(self, base_tensor, teacher_tensor_factory, identity: str):
+        started = time.perf_counter()
+        use_cuda = (torch.is_floating_point(base_tensor) and base_tensor.ndim == 2
+                    and base_tensor.numel() > 0 and self.scale != 0)
+        try:
+            with _tsvm_fp32_matmul():
+                result = self._compute(base_tensor, teacher_tensor_factory, identity)
+        except torch.cuda.OutOfMemoryError as exc:
+            exc.args = (f"Iso-CTS OOM during {self.stage} at {identity}, "
+                        f"shape={tuple(base_tensor.shape)}, device={self.device}: {exc}",)
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Iso-CTS failed during {self.stage} at {identity}, "
+                               f"shape={tuple(base_tensor.shape)}, device={self.device}: {exc}") from exc
+        self.completed_parts += 1
+        self.cuda_parts += int(use_cuda)
+        self.cpu_parts += int(not use_cuda)
+        self.elapsed_seconds += time.perf_counter() - started
+        return result
+
+    def summary(self):
+        report = super().summary()
+        report.update({
+            "method": "iso_cts", "status": "complete",
+            "common_space_fraction": self.common_space_fraction,
+            "rank_rule": "s=min(r//T,round((r-floor(r*f))/T)); k=r-T*s",
+            "common_svd": "standard_reduced", "task_svd": "randomized_lowrank",
+            "orthogonalization": "standard_reduced_svd_procrustes",
+            "niter": self.niter, "oversampling": self.oversampling,
+            "task_svd_q_rule": "min(s + oversampling, min(m,n))",
+            "spectrum": "mean of selected common and task-specific singular values",
+            "factor_order": "teachers in input order, then common",
+            "memory_statistics_scope": "PyTorch allocator peaks since Iso-CTS runtime initialization",
+        })
+        report.pop("svd_input", None)
+        return report
+
+
+def merge_iso_cts(
+    base_state_dict: SafetensorCheckpoint | dict[str, torch.Tensor],
+    teacher_state_dicts: list[SafetensorCheckpoint | dict[str, torch.Tensor]],
+    scale: float = 1.0,
+    *,
+    device: str | torch.device = "auto",
+    common_space_fraction: float = 0.8,
+    niter: int = 4,
+    oversampling: int = 8,
+) -> _StreamingMergedStateDict | dict[str, torch.Tensor]:
+    runtime = _IsoCTSRuntime(num_teachers=len(teacher_state_dicts), scale=scale, device=device,
+                            common_space_fraction=common_space_fraction,
+                            niter=niter, oversampling=oversampling)
+    _validate_compatible_state_dicts(
+        [base_state_dict, *teacher_state_dicts],
+        ["base", *(f"teacher_{i}" for i in range(len(teacher_state_dicts)))],
+    )
+    print(f"Iso-CTS device={runtime.device}; scale={scale}; common fraction={common_space_fraction}; "
+          f"task_svd=randomized_lowrank; niter={niter}; oversampling={oversampling}", flush=True)
+    if isinstance(base_state_dict, SafetensorCheckpoint):
+        if not all(isinstance(sd, SafetensorCheckpoint) for sd in teacher_state_dicts):
+            raise TypeError("Streaming Iso-CTS requires safetensors readers for all teachers")
+        return _StreamingMergedStateDict(
+            base_state_dict, teacher_state_dicts, method="iso_cts", scale=scale, iso_cts=runtime,
+        )
+    packed = _packed_expert_layouts(base_state_dict, teacher_state_dicts)
+    return {
+        key: _merge_state_tensor(
+            key, base_state_dict, teacher_state_dicts, "iso_cts", scale, 1.0, packed, iso_cts=runtime,
+        )
+        for key in base_state_dict
+    }
+
+
+def _orthomerge_cayley(q: torch.Tensor) -> torch.Tensor:
+    identity = torch.eye(q.shape[0], device=q.device, dtype=q.dtype)
+    return torch.linalg.solve(identity - q, identity + q)
+
+
+class _OrthoMergeGRuntime(_TSVMRuntime):
+    """Stream G+TA on CUDA, using right rotations in [output, input] layout."""
+
+    def __init__(self, *, num_teachers: int, scale: float, device: str | torch.device):
+        resolved = torch.device("cuda:0" if str(device) == "auto" else device)
+        if resolved.type != "cuda":
+            raise ValueError("OrthoMerge-G requires a CUDA device")
+        if resolved.index is not None and not 0 <= resolved.index < torch.cuda.device_count():
+            raise ValueError(f"Invalid OrthoMerge-G CUDA device index: {resolved.index}")
+        try:
+            super().__init__(num_teachers=num_teachers, scale=scale, device=resolved)
+        except ValueError as exc:
+            exc.args = (str(exc).replace("TSVM", "OrthoMerge-G"),)
+            raise
+        self.stage = "initialization"
+
+    @torch.inference_mode()
+    def _compute(self, base_tensor, teacher_tensor_factory, *, transpose: bool):
+        self.stage = "base conversion"
+        if not torch.is_floating_point(base_tensor) or base_tensor.numel() == 0:
+            return base_tensor.detach().to(device="cpu", copy=True)
+        base = base_tensor.to(device=self.device, dtype=torch.float32, copy=True)
+        if not torch.isfinite(base).all():
+            raise FloatingPointError("Non-finite FP32 base weights")
+        matrix = base.ndim == 2
+        if transpose:
+            base = base.mT
+        residual = torch.zeros_like(base)
+        if matrix:
+            dim = base.shape[1]
+            eye = torch.eye(dim, device=self.device, dtype=torch.float32)
+            direction = torch.zeros_like(eye)
+            norm_sum = torch.zeros((), device=self.device, dtype=torch.float32)
+        count = 0
+        for task, tensor in enumerate(teacher_tensor_factory()):
+            self.stage = f"teacher {task} conversion"
+            if task >= self.num_teachers or tensor.shape != base_tensor.shape:
+                raise ValueError(f"Teacher {task}: incompatible tensor count or shape")
+            teacher = tensor.to(device=self.device, dtype=torch.float32, copy=True)
+            if transpose:
+                teacher = teacher.mT
+            if not torch.isfinite(teacher).all():
+                raise FloatingPointError("Non-finite FP32 teacher weights")
+            if matrix:
+                self.stage = f"teacher {task} Procrustes SVD"
+                cross = base.mT @ teacher
+                if not torch.isfinite(cross).all():
+                    raise FloatingPointError("Non-finite Procrustes cross product")
+                u, _, vh = torch.linalg.svd(cross, full_matrices=False, driver="gesvd")
+                rotation = u @ vh
+                del cross, u, vh
+                self.stage = f"teacher {task} inverse Cayley solve"
+                q = torch.linalg.solve(rotation + eye, rotation - eye)
+                q = 0.5 * (q - q.mT)
+                del rotation
+                if not torch.isfinite(q).all():
+                    raise FloatingPointError("Non-finite inverse Cayley result")
+                theta = torch.linalg.vector_norm(q)
+                if not torch.isfinite(theta):
+                    raise FloatingPointError("Non-finite rotation magnitude")
+                # Match official theta-weighted direction, including tiny norms.
+                direction.add_(q * (theta / theta.clamp_min(1e-8)))
+                norm_sum.add_(theta)
+                self.stage = f"teacher {task} residual reconstruction"
+                rotation = _orthomerge_cayley(q)
+                teacher.sub_(base @ rotation)
+                del q, theta, rotation
+            else:
+                teacher.sub_(base)
+            residual.add_(teacher)
+            count += 1
+            del teacher, tensor
+        if count != self.num_teachers:
+            raise ValueError(f"Expected {self.num_teachers} teachers, got {count}")
+        if not torch.isfinite(residual).all():
+            raise FloatingPointError("Non-finite accumulated residual")
+        if matrix:
+            self.stage = "magnitude correction"
+            direction_norm = torch.linalg.vector_norm(direction)
+            if not torch.isfinite(direction_norm) or not torch.isfinite(norm_sum):
+                raise FloatingPointError("Non-finite merged rotation magnitude")
+            if direction_norm < 1e-8:
+                direction.zero_()
+            else:
+                direction.div_(direction_norm).mul_(norm_sum / self.num_teachers)
+            self.stage = "merged Cayley solve and reconstruction"
+            rotation = _orthomerge_cayley(direction)
+            result = base @ rotation
+            del direction, norm_sum, eye, rotation
+        else:
+            result = base
+        result.add_(residual, alpha=self.scale)
+        self.stage = "output conversion"
+        if not torch.isfinite(result).all():
+            raise FloatingPointError("Non-finite OrthoMerge-G merged weights")
+        if transpose:
+            result = result.mT
+        stored = result.to(device="cpu", dtype=base_tensor.dtype)
+        if not torch.isfinite(stored).all():
+            raise FloatingPointError(f"OrthoMerge-G weights overflow storage dtype {base_tensor.dtype}")
+        return stored
+
+    def merge(self, base_tensor, teacher_tensor_factory, identity: str,
+              *, transpose: bool = False) -> torch.Tensor:
+        started = time.perf_counter()
+        try:
+            with _tsvm_fp32_matmul():
+                result = self._compute(base_tensor, teacher_tensor_factory, transpose=transpose)
+        except torch.cuda.OutOfMemoryError as exc:
+            exc.args = (f"OrthoMerge-G OOM during {self.stage} at {identity}, "
+                        f"shape={tuple(base_tensor.shape)}, device={self.device}: {exc}",)
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"OrthoMerge-G failed during {self.stage} at {identity}, "
+                               f"shape={tuple(base_tensor.shape)}, device={self.device}: {exc}") from exc
+        self.completed_parts += 1
+        self.elapsed_seconds += time.perf_counter() - started
+        return result
+
+    def summary(self) -> dict:
+        return {
+            "method": "orthomerge_g", "variant": "G+TA", "status": "complete",
+            "num_teachers": self.num_teachers, "scale": self.scale,
+            "scale_scope": "residual sum only; scale=0 retains merged rotation",
+            "parameter_scope": "all floating 2D matrices; packed expert projections",
+            "packed_orientation": "transpose_to_output_input", "rotation_side": "right",
+            "procrustes_svd": "standard_reduced", "cayley": "linear_solve_no_fallback",
+            "direction_weight": "theta", "magnitude_aggregation": "mean",
+            "norm_epsilon": 1e-8, "nonmatrix_rule": "base + scale * sum(teacher-base)",
+            "nonfloating_rule": "copy_base", "device": str(self.device),
+            "compute_dtype": "float32", "tf32": False, "output_dtype": "base_storage_dtype",
+            "completed_parts": self.completed_parts, "elapsed_compute_seconds": self.elapsed_seconds,
+            "cuda_peak_allocated_bytes": torch.cuda.max_memory_allocated(self.device),
+            "cuda_peak_reserved_bytes": torch.cuda.max_memory_reserved(self.device),
+            "memory_statistics_scope": "PyTorch allocator peaks since OrthoMerge-G initialization",
+            "torch_version": torch.__version__, "cuda_version": torch.version.cuda,
+            "reference": "https://github.com/Sphere-AI-Lab/OrthoMerge/blob/main/merge/OrthoMerge_G_TA.py",
+            "paper": "https://arxiv.org/abs/2602.05943",
+        }
+
+
+def merge_orthomerge_g(
+    base_state_dict: SafetensorCheckpoint | dict[str, torch.Tensor],
+    teacher_state_dicts: list[SafetensorCheckpoint | dict[str, torch.Tensor]],
+    scale: float = 1.0,
+    *,
+    device: str | torch.device = "auto",
+) -> _StreamingMergedStateDict | dict[str, torch.Tensor]:
+    """OrthoMerge-G + TA; scale affects residuals, never the merged rotation."""
+    runtime = _OrthoMergeGRuntime(num_teachers=len(teacher_state_dicts), scale=scale, device=device)
+    _validate_compatible_state_dicts(
+        [base_state_dict, *teacher_state_dicts],
+        ["base", *(f"teacher_{i}" for i in range(len(teacher_state_dicts)))],
+    )
+    print(f"OrthoMerge-G+TA device={runtime.device}; residual scale={scale}", flush=True)
+    if isinstance(base_state_dict, SafetensorCheckpoint):
+        if not all(isinstance(sd, SafetensorCheckpoint) for sd in teacher_state_dicts):
+            raise TypeError("Streaming OrthoMerge-G requires safetensors readers for all teachers")
+        return _StreamingMergedStateDict(
+            base_state_dict, teacher_state_dicts, method="orthomerge_g", scale=scale,
+            orthomerge_g=runtime,
+        )
+    packed = _packed_expert_layouts(base_state_dict, teacher_state_dicts)
+    return {
+        key: _merge_state_tensor(
+            key, base_state_dict, teacher_state_dicts, "orthomerge_g", scale, 1.0, packed,
+            orthomerge_g=runtime,
+        )
+        for key in base_state_dict
+    }
+
+
 def _expert_part_indices(layout: tuple[int, int, bool]) -> Iterable[tuple[slice, ...]]:
     experts, intermediate, is_gate_up = layout
     for expert in range(experts):
@@ -1559,11 +1975,14 @@ def _merge_state_tensor(
     density: float,
     packed: dict[str, tuple[int, int, bool]],
     *,
+    compute_device: torch.device | None = None,
     tsvm: _TSVMRuntime | None = None,
     wudi: _WUDIRuntime | None = None,
     dc: _DCRuntime | None = None,
     iso_c: _IsoCRuntime | None = None,
+    iso_cts: _IsoCTSRuntime | None = None,
     ram_plus: _RAMPlusRuntime | None = None,
+    orthomerge_g: _OrthoMergeGRuntime | None = None,
 ) -> torch.Tensor:
     """Dispatch both in-memory and streaming merges through the same partitions."""
     base_tensor = _get_state_tensor(base, key)
@@ -1585,15 +2004,24 @@ def _merge_state_tensor(
     def merge_part(index: tuple[slice, ...] | None) -> torch.Tensor:
         def teacher_parts() -> Iterable[torch.Tensor]:
             return _teacher_parts(teachers, key, index,
-                                  method in ("tsvm", "wudi", "dc", "iso_c", "ram_plus"))
+                                  method in ("tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g"))
 
         part = base_tensor if index is None else base_tensor[index]
-        if method == "ta":
-            return _merge_ta_tensor(part, teacher_parts(), scale)
-        if method == "ties":
-            return _merge_ties_tensor(part, teacher_parts, density, scale)
-        if method in ("tsvm", "wudi", "dc", "iso_c", "ram_plus"):
-            runtime = {"tsvm": tsvm, "wudi": wudi, "dc": dc, "iso_c": iso_c, "ram_plus": ram_plus}[method]
+        if method in ("ta", "ties"):
+            try:
+                if method == "ta":
+                    return _merge_ta_tensor(part, teacher_parts(), scale, device=compute_device)
+                return _merge_ties_tensor(part, teacher_parts, density, scale, device=compute_device)
+            except torch.cuda.OutOfMemoryError as exc:
+                identity = key
+                if index is not None:
+                    projection = ("gate" if index[2].start == 0 else "up") if packed[key][2] else "down"
+                    identity += f"/expert={index[0].start}/projection={projection}"
+                exc.args = (f"{method.upper()} OOM at {identity}, shape={tuple(part.shape)}, "
+                            f"device={compute_device}: {exc}",)
+                raise
+        if method in ("tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g"):
+            runtime = {"tsvm": tsvm, "wudi": wudi, "dc": dc, "iso_c": iso_c, "iso_cts": iso_cts, "ram_plus": ram_plus, "orthomerge_g": orthomerge_g}[method]
             if runtime is None:
                 raise ValueError(f"Missing {method.upper()} runtime")
             identity = key
@@ -1601,22 +2029,22 @@ def _merge_state_tensor(
                 name = ("gate" if index[2].start == 0 else "up") if packed[key][2] else "down"
                 identity = f"{key}/expert={index[0].start}/projection={name}"
                 part = part.squeeze(0)
-            if method == "wudi":
+            if method in ("wudi", "orthomerge_g"):
                 result = runtime.merge(part, teacher_parts, identity, transpose=index is not None)
             else:
                 result = runtime.merge(part, teacher_parts, identity)
             return result.unsqueeze(0) if index is not None else result
         raise ValueError(f"Unsupported merge method: {method}")
 
-    if method in ("tsvm", "wudi", "dc", "iso_c", "ram_plus"):
+    if method in ("tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g"):
         print(f"{method.upper()} merging {key}, shape={expected}", flush=True)
     if key not in packed:
         return merge_part(None)
     experts, intermediate, is_gate_up = packed[key]
-    output = torch.empty_like(base_tensor, device="cpu") if method in ("tsvm", "wudi", "dc", "iso_c", "ram_plus") else torch.empty_like(base_tensor)
+    output = torch.empty_like(base_tensor, device="cpu") if method in ("ta", "ties", "tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g") else torch.empty_like(base_tensor)
     for index in _expert_part_indices(packed[key]):
         expert = index[0].start
-        if (method in ("tsvm", "wudi", "dc", "iso_c", "ram_plus") and expert % 16 == 0
+        if (method in ("tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g") and expert % 16 == 0
                 and (not is_gate_up or index[2].start == 0)):
             print(f"  {method.upper()} expert {expert + 1}/{experts}", flush=True)
         output[index].copy_(merge_part(index))
@@ -1634,22 +2062,28 @@ class _StreamingMergedStateDict:
         scale: float,
         density: float = 0.2,
         *,
+        compute_device: torch.device | None = None,
         tsvm: _TSVMRuntime | None = None,
         wudi: _WUDIRuntime | None = None,
         dc: _DCRuntime | None = None,
         iso_c: _IsoCRuntime | None = None,
+        iso_cts: _IsoCTSRuntime | None = None,
         ram_plus: _RAMPlusRuntime | None = None,
+        orthomerge_g: _OrthoMergeGRuntime | None = None,
     ):
         self.base_state_dict = base_state_dict
         self.teacher_state_dicts = teacher_state_dicts
         self.method = method
         self.scale = scale
         self.density = density
+        self.compute_device = compute_device
         self.tsvm = tsvm
         self.wudi = wudi
         self.dc = dc
         self.iso_c = iso_c
+        self.iso_cts = iso_cts
         self.ram_plus = ram_plus
+        self.orthomerge_g = orthomerge_g
         self.packed_layouts = _packed_expert_layouts(base_state_dict, teacher_state_dicts)
 
     def keys(self) -> list[str]:
@@ -1664,7 +2098,7 @@ class _StreamingMergedStateDict:
     def get_tensor(self, key: str) -> torch.Tensor:
         return _merge_state_tensor(
             key, self.base_state_dict, self.teacher_state_dicts,
-            self.method, self.scale, self.density, self.packed_layouts, tsvm=self.tsvm, wudi=self.wudi, dc=self.dc, iso_c=self.iso_c, ram_plus=self.ram_plus,
+            self.method, self.scale, self.density, self.packed_layouts, compute_device=self.compute_device, tsvm=self.tsvm, wudi=self.wudi, dc=self.dc, iso_c=self.iso_c, iso_cts=self.iso_cts, ram_plus=self.ram_plus, orthomerge_g=self.orthomerge_g,
         )
 
 
@@ -1803,7 +2237,8 @@ def save_merged_model_hf(
     output_dir = Path(output_dir)
     if (isinstance(merged_state_dict, _StreamingMergedStateDict)
             and (merged_state_dict.wudi is not None or merged_state_dict.dc is not None
-                 or merged_state_dict.iso_c is not None or merged_state_dict.ram_plus is not None)):
+                 or merged_state_dict.iso_c is not None or merged_state_dict.iso_cts is not None or merged_state_dict.ram_plus is not None
+                 or merged_state_dict.orthomerge_g is not None)):
         _parse_size_bytes(max_shard_size)
         input_paths = [merged_state_dict.base_state_dict.model_dir,
                        *(sd.model_dir for sd in merged_state_dict.teacher_state_dicts)]
@@ -1817,7 +2252,9 @@ def save_merged_model_hf(
     (output_dir / "wudi_merge_summary.json").unlink(missing_ok=True)
     (output_dir / "dc_merge_summary.json").unlink(missing_ok=True)
     (output_dir / "iso_c_merge_summary.json").unlink(missing_ok=True)
+    (output_dir / "iso_cts_merge_summary.json").unlink(missing_ok=True)
     (output_dir / "ram_plus_merge_summary.json").unlink(missing_ok=True)
+    (output_dir / "orthomerge_g_merge_summary.json").unlink(missing_ok=True)
 
     shard_plan = _plan_output_shards(merged_state_dict, max_shard_size)
     weight_map: dict[str, str] = {}
@@ -1866,7 +2303,7 @@ def save_merged_model_hf(
     processor.save_pretrained(str(output_dir))
     print("Processor saved.")
 
-    runtime = (merged_state_dict.tsvm or merged_state_dict.wudi or merged_state_dict.dc or merged_state_dict.iso_c or merged_state_dict.ram_plus
+    runtime = (merged_state_dict.tsvm or merged_state_dict.wudi or merged_state_dict.dc or merged_state_dict.iso_c or merged_state_dict.iso_cts or merged_state_dict.ram_plus or merged_state_dict.orthomerge_g
                if isinstance(merged_state_dict, _StreamingMergedStateDict) else None)
     if runtime is not None:
         report = runtime.summary()
@@ -1880,11 +2317,11 @@ def save_merged_model_hf(
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Merge teacher models (TA / TIES / TSVM / WUDI / DC-Merge / Iso-C / RAM+).")
+    parser = argparse.ArgumentParser(description="Merge teacher models (TA / TIES / TSVM / WUDI / DC-Merge / Iso-C / Iso-CTS / RAM+ / OrthoMerge-G).")
     parser.add_argument(
         "method",
-        choices=["ta", "ties", "tsvm", "wudi", "dc", "iso_c", "ram_plus"],
-        help="ta = task arithmetic; ties = TIES merging; tsvm = task singular vector merging; wudi = WUDI linear-weight merging; dc = FFT DC-Merge; iso_c = isotropic common-subspace merging; ram_plus = reinforced agent merging",
+        choices=["ta", "ties", "tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g"],
+        help="ta = task arithmetic; ties = TIES merging; tsvm = task singular vector merging; wudi = WUDI linear-weight merging; dc = FFT DC-Merge; iso_c = isotropic common-subspace merging; iso_cts = common and task-specific isotropic merging; ram_plus = reinforced agent merging; orthomerge_g = global orthogonal merging + TA",
     )
     parser.add_argument(
         "--teachers",
@@ -1912,7 +2349,7 @@ def _parse_args() -> argparse.Namespace:
         "--scale",
         type=float,
         default=1.0,
-        help="Global scale applied to the summed TA task vector or merged TIES/TSVM/WUDI/DC/Iso-C/RAM+ task vector (default: 1.0)",
+        help="Global scale applied to the summed TA task vector or merged TIES/TSVM/WUDI/DC/Iso-C/Iso-CTS/RAM+ task vector; OrthoMerge-G scales only residuals (default: 1.0)",
     )
     parser.add_argument(
         "--teacher-names",
@@ -1931,15 +2368,17 @@ def _parse_args() -> argparse.Namespace:
         help="Pass trust_remote_code to transformers (default: True)",
     )
     parser.add_argument("--device", default="auto",
-                        help="TSVM/WUDI/DC/Iso-C/RAM+ compute device: auto, cpu, cuda:0, ... (default: auto; Iso-C requires CUDA for matrices; RAM+ requires CUDA; TA/TIES unchanged)")
+                        help="Compute device: auto, cpu, cuda:0, ... (default: auto; TA/TIES auto requires CUDA, explicit cpu supported; Iso-C/Iso-CTS require CUDA for matrices; RAM+/OrthoMerge-G require CUDA)")
     parser.add_argument("--ram-threshold", type=float, default=1e-5,
                         help="RAM+ active update threshold, nonnegative (default: 1e-5)")
     parser.add_argument("--ram-rescale-factor", type=float, default=1.2,
                         help="RAM+ unique update rescale bound; values <=1 mean RAM (default: 1.2)")
+    parser.add_argument("--iso-cts-common-space-fraction", type=float, default=0.8,
+                        help="Iso-CTS common-space fraction in [0,1] before rank rounding (default: 0.8)")
     parser.add_argument("--niter", type=int, default=4,
-                        help="TSVM/DC task low-rank SVD subspace iterations, nonnegative (default: 4)")
+                        help="TSVM/DC/Iso-CTS task low-rank SVD subspace iterations, nonnegative (default: 4)")
     parser.add_argument("--oversampling", type=int, default=8,
-                        help="TSVM/DC extra sampled directions beyond retained rank, nonnegative (default: 8)")
+                        help="TSVM/DC/Iso-CTS extra sampled directions beyond retained rank, nonnegative (default: 8)")
     parser.add_argument("--wudi-steps", type=int, default=300,
                         help="Nonnegative WUDI Adam iteration count (default: 300)")
     parser.add_argument("--wudi-lr", type=float, default=1e-5,
@@ -1962,7 +2401,7 @@ def main() -> None:
             f"got {len(teacher_names)}."
         )
     base_path = Path(args.base)
-    if args.method in ("tsvm", "wudi", "dc", "iso_c", "ram_plus"):
+    if args.method in ("tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g"):
         _parse_size_bytes(args.max_shard_size)
         if Path(args.output).resolve() in {base_path.resolve(), *(p.resolve() for p in teacher_paths)}:
             raise ValueError(f"{args.method.upper()} output directory must differ from all input checkpoints")
@@ -1991,6 +2430,7 @@ def main() -> None:
                 base_state,
                 teacher_states,
                 scale=args.scale,
+                device=args.device,
             )
         elif args.method == "ties":
             print(f"TIES density: {args.ties_density}; scale: {args.scale}")
@@ -1999,11 +2439,22 @@ def main() -> None:
                 teacher_states,
                 density=args.ties_density,
                 scale=args.scale,
+                device=args.device,
+            )
+        elif args.method == "orthomerge_g":
+            merged = merge_orthomerge_g(
+                base_state, teacher_states, scale=args.scale, device=args.device,
             )
         elif args.method == "ram_plus":
             merged = merge_ram_plus(
                 base_state, teacher_states, scale=args.scale, device=args.device,
                 threshold=args.ram_threshold, rescale_factor=args.ram_rescale_factor,
+            )
+        elif args.method == "iso_cts":
+            merged = merge_iso_cts(
+                base_state, teacher_states, scale=args.scale, device=args.device,
+                common_space_fraction=args.iso_cts_common_space_fraction,
+                niter=args.niter, oversampling=args.oversampling,
             )
         elif args.method == "iso_c":
             merged = merge_iso_c(
