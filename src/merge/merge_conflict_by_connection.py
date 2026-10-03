@@ -25,6 +25,11 @@ Saliency and task-vector differences are computed in FP32; synthetic forward
 precision remains controlled by --compute-dtype. Repair accumulation is FP32
 with one final cast to context storage precision.
 
+Optional --apply-svc calibrates non-expert 2D floating-point context-minus-base
+updates using the target teachers (arXiv:2602.05536v2, Eqs. 17-23). Calibration
+runs in CUDA FP32 during streaming checkpoint saving; expert repair and scoring
+are unchanged. --svc-alpha defaults to 1 (suppression only).
+
 Example (the channel fraction is an explicit experimental choice):
 
     python src/merge/merge_conflict_by_connection.py \
@@ -649,6 +654,13 @@ def _jvp_summary(rows: list[dict]) -> dict:
     }
 
 
+def _validate_svc_options(alpha: float, eps: float) -> None:
+    if not math.isfinite(alpha) or not 0 < alpha <= 1:
+        raise ValueError("--svc-alpha must be finite and in (0, 1]")
+    if not math.isfinite(eps) or eps <= 0:
+        raise ValueError("--svc-eps must be finite and positive")
+
+
 class ConnectionRepairCheckpoint(ConflictRepairCheckpoint):
     """Use the existing checkpoint interface with channel-masked shared updates."""
 
@@ -664,6 +676,9 @@ class ConnectionRepairCheckpoint(ConflictRepairCheckpoint):
         shared_coefficients: dict[Slot, tuple[float, ...]],
         channel_selections: ChannelSelections,
         shared_repair_scale: float = 1.0,
+        svc_device: torch.device | None = None,
+        svc_alpha: float = 1.0,
+        svc_eps: float = 1e-12,
     ) -> None:
         if not math.isfinite(shared_repair_scale) or shared_repair_scale < 0:
             raise ValueError("shared_repair_scale must be finite and nonnegative")
@@ -686,6 +701,101 @@ class ConnectionRepairCheckpoint(ConflictRepairCheckpoint):
         self.channel_selections = channel_selections
         # Per-projection squared norms are replaced on repeated reads, not added.
         self._increment_squared_norms: dict[Slot, dict[str, tuple[float, float]]] = {}
+        self.svc_device = svc_device
+        self.svc_alpha = svc_alpha
+        self.svc_eps = svc_eps
+        self._svc_results: dict[str, str] = {}
+        if svc_device is not None:
+            _validate_svc_options(svc_alpha, svc_eps)
+            if svc_device.type != "cuda" or not torch.cuda.is_available():
+                raise ValueError("--apply-svc requires a CUDA --device; no CPU fallback")
+            if not teachers:
+                raise ValueError("SVC requires at least one target teacher")
+
+    def get_tensor(self, key: str) -> torch.Tensor:
+        if self.svc_device is None or key in self.expert_key_layout:
+            return super().get_tensor(key)
+        context = self.context.get_tensor(key)
+        if (context.ndim != 2 or not context.is_floating_point()
+                or "mlp.experts.down_proj" in key or "mlp.experts.gate_up_proj" in key):
+            return context
+        return self._calibrate_svc_tensor(key, context)
+
+    @torch.inference_mode()
+    def _calibrate_svc_tensor(self, key: str, context: torch.Tensor) -> torch.Tensor:
+        """Full-spectrum, left-space SVC; hold only one teacher delta at a time.
+
+        Matches the all-task formula in the official SVC merge_func.py Align /
+        coef_cal_multi_ranks, applied to this checkpoint's target teacher subset.
+        No extra merge scaling, task stacking, driver override, or SVD retry.
+        """
+        stage = "load context/base delta"
+        print(f"SVC: {key}, shape={tuple(context.shape)}, device={self.svc_device}", flush=True)
+        try:
+            base = self.base.get_tensor(key).to(device=self.svc_device, dtype=torch.float32)
+            delta = context.to(device=self.svc_device, dtype=torch.float32).sub_(base)
+            if not torch.isfinite(delta).all():
+                raise FloatingPointError("Non-finite context/base delta")
+            if not torch.count_nonzero(delta).item():
+                self._svc_results[key] = "zero_delta"
+                return context
+            stage = "SVD"
+            u, s, vh = torch.linalg.svd(delta, full_matrices=False)
+            if not all(torch.isfinite(x).all() for x in (u, s, vh)):
+                raise FloatingPointError("Non-finite SVD factors")
+            stage = "merged projection"
+            merged_response = u.T @ delta
+            del delta
+            coefficient_sum = torch.zeros_like(s)
+            for task, teacher in self.teachers.items():
+                stage = f"teacher projection ({task})"
+                task_delta = teacher.get_tensor(key).to(
+                    device=self.svc_device, dtype=torch.float32
+                ).sub_(base)
+                if not torch.isfinite(task_delta).all():
+                    raise FloatingPointError("Non-finite teacher/base delta")
+                response = u.T @ task_delta
+                del task_delta
+                denominator = response.square().sum(dim=1).clamp_min_(self.svc_eps)
+                coefficients = (merged_response * response).sum(dim=1) / denominator
+                if not torch.isfinite(coefficients).all():
+                    raise FloatingPointError("Non-finite SVC projection coefficients")
+                coefficient_sum.add_(coefficients.clamp_min_(self.svc_alpha))
+                del response, denominator, coefficients
+            del merged_response
+            stage = "calibration/reconstruction"
+            if not torch.isfinite(coefficient_sum).all():
+                raise FloatingPointError("Non-finite SVC coefficient sum")
+            calibrated_s = s * (len(self.teachers) / coefficient_sum)
+            output = base.add_((u * calibrated_s.unsqueeze(0)) @ vh)
+            if not torch.isfinite(output).all():
+                raise FloatingPointError("Non-finite SVC weights")
+            stage = "storage conversion"
+            output = output.to(dtype=context.dtype)
+            if not torch.isfinite(output).all():
+                raise FloatingPointError(f"Non-finite SVC weights after conversion to {context.dtype}")
+            output = output.cpu()
+            self._svc_results[key] = "calibrated"
+            return output
+        except (RuntimeError, FloatingPointError) as exc:
+            # Preserve OOM / linalg exception types; never retry on CPU or add noise.
+            exc.add_note(f"SVC key={key}, shape={tuple(context.shape)}, "
+                         f"device={self.svc_device}, stage={stage}")
+            raise
+
+    def svc_report(self) -> dict | None:
+        if self.svc_device is None:
+            return None
+        return {
+            "enabled": True, "alpha": self.svc_alpha, "eps": self.svc_eps,
+            "device": str(self.svc_device), "compute_dtype": "float32",
+            "svd_driver": "default", "target_tasks": list(self.teachers),
+            "scope": "non_expert_2d_floating_tensors",
+            "merged_delta": "context_minus_base; no_additional_scaling",
+            "processed_tensors": len(self._svc_results),
+            "calibrated_tensors": sum(v == "calibrated" for v in self._svc_results.values()),
+            "zero_delta_tensors": sum(v == "zero_delta" for v in self._svc_results.values()),
+        }
 
     @torch.inference_mode()
     def _repair_packed_expert_tensor(self, key: str, layout: ExpertLayerLayout) -> torch.Tensor:
@@ -791,6 +901,7 @@ def _save_reports(
     eps: float,
     device: torch.device,
     compute_dtype: torch.dtype,
+    svc_report: dict | None = None,
 ) -> None:
     total_slots = sum(layout.num_experts for layout in layouts)
     selected_tasks_by_slot: dict[Slot, list[str]] = {}
@@ -929,6 +1040,11 @@ def _save_reports(
             "and real hidden-state distributions are not measured"
         ),
     }
+    if svc_report is not None:
+        report["svc"] = svc_report
+        report["semantics"]["non_expert_tensors"] = (
+            "svc_on_2d_floating_context_minus_base; otherwise_copy_context"
+        )
     if coefficient_mode == "masked-jvp":
         report["formulas"]["original_repair_coefficient"] = report["formulas"]["repair_coefficient"]
         report["formulas"]["repair_coefficient"] = (
@@ -1046,7 +1162,8 @@ def _parse_args() -> argparse.Namespace:
         required=True,
         help=(
             "Previously merged checkpoint to score and repair. Unselected experts "
-            "and non-expert tensors are copied from this model"
+            "and non-expert tensors are copied from this model unless --apply-svc "
+            "calibrates non-expert 2D floating tensors"
         ),
     )
     parser.add_argument(
@@ -1108,7 +1225,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device",
         default="auto",
-        help="Scoring device, e.g. auto, cuda:0, or cpu (default: auto)",
+        help="Compute device, e.g. auto, cuda:0, or cpu; --apply-svc requires CUDA (default: auto)",
     )
     parser.add_argument(
         "--compute-dtype",
@@ -1183,12 +1300,28 @@ def _parse_args() -> argparse.Namespace:
               "do not invalidate it; cached scores remain authoritative. Clear this cache "
               "if weights change at the same path. Reference CSVs are validation-only"),
     )
+    parser.add_argument(
+        "--apply-svc", action="store_true",
+        help=("Calibrate non-expert 2D floating context-minus-base updates with SVC "
+              "using --target-tasks teachers (default: all). Runs in CUDA FP32 "
+              "during saving; does not change expert repair or scoring"),
+    )
+    parser.add_argument(
+        "--svc-alpha", type=float, default=1.0,
+        help="SVC projection coefficient floor in (0, 1]; 1 suppresses only (default: 1)",
+    )
+    parser.add_argument(
+        "--svc-eps", type=float, default=1e-12,
+        help="Positive SVC projection-energy denominator floor (default: 1e-12)",
+    )
     return parser.parse_args()
 
 
 
 def main() -> None:
     args = _parse_args()
+    if args.apply_svc:
+        _validate_svc_options(args.svc_alpha, args.svc_eps)
     if not math.isfinite(args.shared_repair_scale) or args.shared_repair_scale < 0:
         raise ValueError("--shared-repair-scale must be finite and nonnegative")
     if not math.isfinite(args.channel_keep_fraction) or not 0 <= args.channel_keep_fraction <= 1:
@@ -1253,6 +1386,8 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = False
 
     device = _resolve_device(args.device)
+    if args.apply_svc and device.type != "cuda":
+        raise ValueError("--apply-svc requires a CUDA --device; no CPU fallback")
     compute_dtype = _resolve_compute_dtype(args.compute_dtype, device)
     print(f"Scoring device={device}, compute_dtype={compute_dtype}")
     print(f"Context model: {context_dir}")
@@ -1337,7 +1472,8 @@ def main() -> None:
         print(
             "Unique selections copy the complete teacher expert. Shared experts "
             "add shared_repair_scale times the summed masked task repairs to context. "
-            "Unselected experts and non-expert tensors retain context."
+            + ("Unselected experts retain context; non-expert 2D floating tensors use SVC."
+               if args.apply_svc else "Unselected experts and non-expert tensors retain context.")
         )
 
         repaired_state = ConnectionRepairCheckpoint(
@@ -1350,6 +1486,9 @@ def main() -> None:
             shared_coefficients=shared_coefficients,
             channel_selections=channel_selections,
             shared_repair_scale=args.shared_repair_scale,
+            svc_device=device if args.apply_svc else None,
+            svc_alpha=args.svc_alpha,
+            svc_eps=args.svc_eps,
         )
         # All input/reference checks, scoring, mask construction and coefficient
         # fitting have succeeded. Only now begin replacing the output checkpoint.
@@ -1385,6 +1524,7 @@ def main() -> None:
             jvp_diagnostics=jvp_diagnostics,
             reference_repair_scores=args.reference_repair_scores,
             increment_norms=repaired_state.increment_norm_report(),
+            svc_report=repaired_state.svc_report(),
             scoring_info=scoring_info,
             shared_repair_scale=args.shared_repair_scale,
             base_dir=base_dir,
@@ -1400,14 +1540,17 @@ def main() -> None:
         )
 
     with (output_dir / "repair_complete.json").open("w", encoding="utf-8") as f:
-        json.dump({
+        completion = {
             "status": "complete",
             "repair_mode": ("copy_unique_sum_shared_connection_jvp"
                             if args.coefficient_mode == "masked-jvp"
                             else "copy_unique_sum_shared_connection"),
             "coefficient_mode": args.coefficient_mode,
             "shared_repair_scale": args.shared_repair_scale,
-        }, f)
+        }
+        if args.apply_svc:
+            completion["svc"] = repaired_state.svc_report()
+        json.dump(completion, f)
         f.write("\n")
 
     print(
