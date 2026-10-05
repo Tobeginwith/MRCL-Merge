@@ -2,10 +2,8 @@
 """Repair shared MoE experts with connection-salient channel updates.
 
 Expert selection uses the original context and complete teacher outputs.
-The default --coefficient-mode directional reuses merge_conflict.py coefficients.
-With --coefficient-mode masked-jvp, coefficients are refitted in FP32 against
-the actual masked task-vector response at the original context weights. Unique selections
-copy the full teacher expert. For a shared expert e, only selecting tasks S_e
+Repair reuses the directional coefficients from merge_conflict.py. Unique
+selections copy the full teacher expert. For a shared expert e, only selecting tasks S_e
 contribute:
 
     theta'_e = theta_context,e + scale * sum_t a_t,e * M_t,e * (theta_t,e - theta_base,e)
@@ -15,7 +13,7 @@ channels. A channel mask couples both gate/up columns and the corresponding
 down row in the input-major packed checkpoint. There is no
 channel-fraction normalization and no cross-task agreement modulation or iterative pruning.
 --shared-repair-scale (default 1) scales the combined shared-expert increment
-in either coefficient mode; unique teacher copies are unaffected.
+using directional coefficients; unique teacher copies are unaffected.
 
 The expert-local connection proxy is R = sum_j g_j * u_j * d_j, where g/u/d
 are teacher L1 connection strengths. Channel saliency is sum_p |delta_p dR/dp|,
@@ -37,8 +35,8 @@ Example (the channel fraction is an explicit experimental choice):
         --teachers /models/med /models/puzzle /models/nav /models/math \
         --task-names medvqa puzzle navigation wemath2 \
         --selection-score i_task --num-probes 32 --repair-fraction 0.125 \
-        --channel-keep-fraction 0.25 --coefficient-mode masked-jvp \
-        --output /models/connection-repair-jvp
+        --channel-keep-fraction 0.25 \
+        --output /models/connection-repair
 """
 
 from __future__ import annotations
@@ -52,12 +50,12 @@ import os
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -259,7 +257,7 @@ def score_repairs_with_cache(
     probes_cpu: torch.Tensor, *, cache_dir: Path | None, cache_config: dict,
     device: torch.device, compute_dtype: torch.dtype, expert_batch_size: int, eps: float,
 ) -> tuple[dict[str, TaskScoreMap], dict]:
-    """Cache only original full-expert scores, before selection, masking or JVP."""
+    """Cache only original full-expert scores, before selection or masking."""
     started = time.perf_counter()
     path = _score_cache_path(cache_dir, cache_config) if cache_dir is not None else None
     info = {"cache_status": "disabled" if path is None else "miss",
@@ -400,90 +398,13 @@ def build_channel_selections(
 
 
 
-JVP_DIAGNOSTIC_FIELDS = (
-    "task_name", "layer_index", "expert_id", "original_coefficient",
-    "original_fp32_coefficient", "original_fp32_difference", "raw_jvp_coefficient",
-    "jvp_coefficient", "coefficient_difference", "jvp_l2", "context_residual_l2",
-    "old_single_residual_l2", "new_single_residual_l2", "linear_residual_l2",
-    "linearization_error_l2", "linearization_relative_error",
-    "old_joint_residual_l2", "new_joint_residual_l2",
-    "old_masked_increment_l2", "new_masked_increment_l2",
-)
-
-
-def _tensor_l2(value: torch.Tensor) -> float:
-    result = value.double().square().sum().sqrt().item()
-    if not math.isfinite(result):
-        raise FloatingPointError("Non-finite diagnostic norm")
-    return result
-
-
-def _weights_l2(weights: tuple[torch.Tensor, ...]) -> float:
-    return math.sqrt(sum(_tensor_l2(w) ** 2 for w in weights))
-
-
-@torch.inference_mode()
-def swiglu_masked_jvp(
-    probes: torch.Tensor,
-    context_weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    direction: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-) -> torch.Tensor:
-    """FP32 analytic weight JVP at context; all weights use input-major layout.
-
-    The direction is M * (teacher-base), without any old repair coefficient.
-    Outputs have shape [experts, probes, hidden]. No Jacobian is materialized.
-    """
-    probes = probes.float()
-    gate, up, down = (w.float() for w in context_weights)
-    vg, vu, vd = (w.float() for w in direction)
-    if any(not torch.isfinite(w).all() for w in (probes, gate, up, down, vg, vu, vd)):
-        raise FloatingPointError("Non-finite JVP inputs")
-    if any(w.shape != v.shape for w, v in zip((gate, up, down), (vg, vu, vd))):
-        raise ValueError("JVP direction must match context weight shapes")
-    g = torch.einsum("rh,ehi->eri", probes, gate)
-    u = torch.einsum("rh,ehi->eri", probes, up)
-    dg = torch.einsum("rh,ehi->eri", probes, vg)
-    du = torch.einsum("rh,ehi->eri", probes, vu)
-    sigmoid = torch.sigmoid(g)
-    silu = F.silu(g)
-    derivative = sigmoid + g * sigmoid * (1.0 - sigmoid)
-    response = torch.einsum("eri,eih->erh", silu * u, vd)
-    response = response + torch.einsum(
-        "eri,eih->erh", derivative * dg * u + silu * du, down)
-    if not torch.isfinite(response).all():
-        raise FloatingPointError("Non-finite masked SwiGLU JVP")
-    return response
-
-
-@torch.inference_mode()
-def project_jvp_coefficient(
-    residual: torch.Tensor, jvp: torch.Tensor, eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return clipped and raw per-expert coefficients for the masked direction."""
-    if not math.isfinite(eps) or eps <= 0:
-        raise ValueError("eps must be finite and positive")
-    if residual.ndim != 3 or residual.shape != jvp.shape:
-        raise ValueError("Residual and JVP must share [experts, probes, hidden] shape")
-    residual, jvp = residual.float(), jvp.float()
-    if not torch.isfinite(residual).all() or not torch.isfinite(jvp).all():
-        raise FloatingPointError("Non-finite residual or JVP")
-    numerator = (residual * jvp).sum(dim=(-2, -1))
-    denominator = jvp.square().sum(dim=(-2, -1)) + eps
-    if not torch.isfinite(numerator).all() or not torch.isfinite(denominator).all():
-        raise FloatingPointError("Non-finite JVP projection reduction")
-    raw = numerator / denominator
-    if not torch.isfinite(raw).all():
-        raise FloatingPointError("Non-finite JVP repair coefficient")
-    return raw.clamp(0.0, 1.0), raw
-
-
 def validate_reference_selections(
     reference_csv: Path,
     scores_by_task: dict[str, TaskScoreMap],
     selected_by_task: dict[str, frozenset[Slot]],
     channel_selections: ChannelSelections,
 ) -> None:
-    """Reject any changed expert/task selection or channel mask before refitting."""
+    """Reject any changed expert/task selection or channel mask before repairs."""
     expected = {(task, *slot) for task, scores in scores_by_task.items() for slot in scores}
     seen = set()
     with reference_csv.open(encoding="utf-8") as stream:
@@ -514,151 +435,82 @@ def validate_reference_selections(
     print(f"Verified fixed expert selections and channel masks against {reference_csv}")
 
 
-@torch.inference_mode()
-def reestimate_masked_jvp_coefficients(
-    base: SafetensorCheckpoint,
-    context: SafetensorCheckpoint,
-    teachers: dict[str, SafetensorCheckpoint],
-    layouts: list[ExpertLayerLayout],
-    shared_tasks: dict[Slot, tuple[str, ...]],
-    channel_selections: ChannelSelections,
-    original_coefficients: dict[Slot, tuple[float, ...]],
-    probes_cpu: torch.Tensor,
-    *,
-    device: torch.device,
-    eps: float,
-    shared_repair_scale: float = 1.0,
-) -> tuple[dict[Slot, tuple[float, ...]], list[dict]]:
-    """Refit one shared expert at a time; diagnostics use pre-storage FP32 weights.
-
-    Masks and original scores are never modified. Each task is fitted separately
-    at the original context. Coefficient fitting is independent of the shared scale;
-    residuals and increment norms measure updates after applying that scale.
-    """
-    probes = probes_cpu.to(device=device, dtype=torch.float32)
-    layouts_by_layer = {layout.layer_index: layout for layout in layouts}
-    coefficients, diagnostics = {}, []
-    previous_layer = None
-    for slot, tasks in sorted(shared_tasks.items()):
-        layout = layouts_by_layer[slot[0]]
-        if previous_layer != slot[0]:
-            print(f"Refitting masked JVP coefficients: {layout.label}")
-            previous_layer = slot[0]
-        stage = "context/base outputs"
-        try:
-            def load(checkpoint):
-                return tuple(w.to(device=device, dtype=torch.float32) for w in
-                             layout.load_expert_batch(checkpoint, slot[1], slot[1] + 1))
-
-            def forward(weights):
-                return _swiglu_expert_forward(
-                    probes, *weights, device=device, compute_dtype=torch.float32)
-
-            bw, cw = load(base), load(context)
-            base_output, context_output = forward(bw), forward(cw)
-            old_joint, new_joint = tuple(w.clone() for w in cw), tuple(w.clone() for w in cw)
-            old_increment = tuple(torch.zeros_like(w) for w in cw)
-            new_increment = tuple(torch.zeros_like(w) for w in cw)
-            slot_rows, teacher_outputs, fitted = [], {}, []
-            for task, old_a in zip(tasks, original_coefficients[slot]):
-                stage = f"task={task}"
-                tw = load(teachers[task])
-                teacher_output = forward(tw)
-                teacher_outputs[task] = teacher_output
-                mask = channel_selections[slot][task].mask.to(device)
-                masks = (mask[None, None, :], mask[None, None, :], mask[None, :, None])
-                direction = tuple((t - b).masked_fill(~m, 0.0)
-                                  for t, b, m in zip(tw, bw, masks))
-                jvp = swiglu_masked_jvp(probes, cw, direction)
-                residual = teacher_output - context_output
-                a_tensor, raw = project_jvp_coefficient(residual, jvp, eps)
-                a = a_tensor.item()
-                fitted.append(a)
-                old_fp32 = directional_repair_coefficient(
-                    base_output, context_output, teacher_output, eps).item()
-                old_delta = tuple(old_a * v for v in direction)
-                new_delta = tuple(a * v for v in direction)
-                old_single = forward(tuple(c + shared_repair_scale * d for c, d in zip(cw, old_delta)))
-                new_single = forward(tuple(c + shared_repair_scale * d for c, d in zip(cw, new_delta)))
-                prediction = context_output + (shared_repair_scale * a) * jvp
-                linear_error = _tensor_l2(new_single - prediction)
-                for i in range(3):
-                    old_joint[i].add_(old_delta[i])
-                    new_joint[i].add_(new_delta[i])
-                    old_increment[i].add_(old_delta[i])
-                    new_increment[i].add_(new_delta[i])
-                slot_rows.append({
-                    "task_name": task, "layer_index": slot[0], "expert_id": slot[1],
-                    "original_coefficient": old_a,
-                    "original_fp32_coefficient": old_fp32,
-                    "original_fp32_difference": old_fp32 - old_a,
-                    "raw_jvp_coefficient": raw.item(), "jvp_coefficient": a,
-                    "coefficient_difference": a - old_a, "jvp_l2": _tensor_l2(jvp),
-                    "context_residual_l2": _tensor_l2(residual),
-                    "old_single_residual_l2": _tensor_l2(teacher_output - old_single),
-                    "new_single_residual_l2": _tensor_l2(teacher_output - new_single),
-                    "linear_residual_l2": _tensor_l2(residual - (shared_repair_scale * a) * jvp),
-                    "linearization_error_l2": linear_error,
-                    "linearization_relative_error": linear_error / (_tensor_l2(new_single - context_output) + eps),
-                })
-                del tw, direction, jvp, old_delta, new_delta
-            stage = "joint forward diagnostics"
-            if shared_repair_scale != 1.0:
-                old_joint = tuple(c + shared_repair_scale * d for c, d in zip(cw, old_increment))
-                new_joint = tuple(c + shared_repair_scale * d for c, d in zip(cw, new_increment))
-            old_output, new_output = forward(old_joint), forward(new_joint)
-            old_norm = _weights_l2(tuple(shared_repair_scale * d for d in old_increment))
-            new_norm = _weights_l2(tuple(shared_repair_scale * d for d in new_increment))
-            for row in slot_rows:
-                teacher_output = teacher_outputs[row["task_name"]]
-                row.update({
-                    "old_joint_residual_l2": _tensor_l2(teacher_output - old_output),
-                    "new_joint_residual_l2": _tensor_l2(teacher_output - new_output),
-                    "old_masked_increment_l2": old_norm,
-                    "new_masked_increment_l2": new_norm,
-                })
-            coefficients[slot] = tuple(fitted)
-            diagnostics.extend(slot_rows)
-            del bw, cw, old_joint, new_joint, old_increment, new_increment, teacher_outputs
-        except FloatingPointError as exc:
-            raise FloatingPointError(f"Masked JVP failed at {slot}, {stage}: {exc}") from exc
-    return coefficients, diagnostics
-
-
-def _jvp_summary(rows: list[dict]) -> dict:
-    def summarize(group):
-        return {
-            "count": len(group),
-            "zero_coefficient_fraction": (sum(r["jvp_coefficient"] == 0 for r in group)
-                                          / len(group) if group else 0.0),
-            "one_coefficient_fraction": (sum(r["jvp_coefficient"] == 1 for r in group)
-                                         / len(group) if group else 0.0),
-            "zero_coefficients": sum(r["jvp_coefficient"] == 0 for r in group),
-            "one_coefficients": sum(r["jvp_coefficient"] == 1 for r in group),
-            "clipped_below_zero": sum(r["raw_jvp_coefficient"] < 0 for r in group),
-            "clipped_above_one": sum(r["raw_jvp_coefficient"] > 1 for r in group),
-            **{key: _summarize_values([r[key] for r in group]) for key in
-               ("original_coefficient", "original_fp32_coefficient", "jvp_coefficient",
-                "coefficient_difference", "original_fp32_difference", "jvp_l2",
-                "linearization_relative_error")},
-        }
-    return {
-        "arithmetic_dtype": "float32",
-        "norm_reduction_dtype": "float64",
-        "forward_diagnostics": "actual nonlinear SwiGLU at FP32 pre-storage weights",
-        "linearization_relative_error": "||f(C+aV)-f(C)-aJ|| / (||f(C+aV)-f(C)|| + eps)",
-        "increment_comparison": "old and refitted coefficients with the same channel masks",
-        "overall": summarize(rows),
-        "per_task": {task: summarize([r for r in rows if r["task_name"] == task])
-                     for task in sorted({r["task_name"] for r in rows})},
-    }
-
-
 def _validate_svc_options(alpha: float, eps: float) -> None:
     if not math.isfinite(alpha) or not 0 < alpha <= 1:
         raise ValueError("--svc-alpha must be finite and in (0, 1]")
     if not math.isfinite(eps) or eps <= 0:
         raise ValueError("--svc-eps must be finite and positive")
+
+
+@torch.inference_mode()
+def _calibrate_svc_matrix(
+    key: str,
+    context: torch.Tensor,
+    load_base: Callable[[], torch.Tensor],
+    teacher_loaders: dict[str, Callable[[], torch.Tensor]],
+    *,
+    device: torch.device,
+    alpha: float,
+    eps: float,
+) -> tuple[torch.Tensor, str]:
+    """Full-spectrum left-space SVC with lazy CPU matrix loaders.
+
+    Input matrices use [output, input] orientation. Matches the all-task formula
+    in the official SVC merge_func.py Align / coef_cal_multi_ranks, applied to
+    the supplied teacher subset. No extra scaling, stacking, driver override,
+    or SVD retry. Callers validate options and configure CUDA FP32 without TF32.
+    """
+    stage = "load context/base delta"
+    print(f"SVC: {key}, shape={tuple(context.shape)}, device={device}", flush=True)
+    try:
+        base = load_base().to(device=device, dtype=torch.float32)
+        delta = context.to(device=device, dtype=torch.float32).sub_(base)
+        if not torch.isfinite(delta).all():
+            raise FloatingPointError("Non-finite context/base delta")
+        if not torch.count_nonzero(delta).item():
+            return context, "zero_delta"
+        stage = "SVD"
+        u, s, vh = torch.linalg.svd(delta, full_matrices=False)
+        if not all(torch.isfinite(x).all() for x in (u, s, vh)):
+            raise FloatingPointError("Non-finite SVD factors")
+        stage = "merged projection"
+        merged_response = u.T @ delta
+        del delta
+        coefficient_sum = torch.zeros_like(s)
+        for task, load_teacher in teacher_loaders.items():
+            stage = f"teacher projection ({task})"
+            task_delta = load_teacher().to(
+                device=device, dtype=torch.float32
+            ).sub_(base)
+            if not torch.isfinite(task_delta).all():
+                raise FloatingPointError("Non-finite teacher/base delta")
+            response = u.T @ task_delta
+            del task_delta
+            denominator = response.square().sum(dim=1).clamp_min_(eps)
+            coefficients = (merged_response * response).sum(dim=1) / denominator
+            if not torch.isfinite(coefficients).all():
+                raise FloatingPointError("Non-finite SVC projection coefficients")
+            coefficient_sum.add_(coefficients.clamp_min_(alpha))
+            del response, denominator, coefficients
+        del merged_response
+        stage = "calibration/reconstruction"
+        if not torch.isfinite(coefficient_sum).all():
+            raise FloatingPointError("Non-finite SVC coefficient sum")
+        calibrated_s = s * (len(teacher_loaders) / coefficient_sum)
+        output = base.add_((u * calibrated_s.unsqueeze(0)) @ vh)
+        if not torch.isfinite(output).all():
+            raise FloatingPointError("Non-finite SVC weights")
+        stage = "storage conversion"
+        output = output.to(dtype=context.dtype)
+        if not torch.isfinite(output).all():
+            raise FloatingPointError(f"Non-finite SVC weights after conversion to {context.dtype}")
+        output = output.cpu()
+        return output, "calibrated"
+    except (RuntimeError, FloatingPointError) as exc:
+        # Preserve OOM / linalg exception types; never retry on CPU or add noise.
+        exc.add_note(f"SVC key={key}, shape={tuple(context.shape)}, "
+                     f"device={device}, stage={stage}")
+        raise
 
 
 class ConnectionRepairCheckpoint(ConflictRepairCheckpoint):
@@ -721,67 +573,15 @@ class ConnectionRepairCheckpoint(ConflictRepairCheckpoint):
             return context
         return self._calibrate_svc_tensor(key, context)
 
-    @torch.inference_mode()
     def _calibrate_svc_tensor(self, key: str, context: torch.Tensor) -> torch.Tensor:
-        """Full-spectrum, left-space SVC; hold only one teacher delta at a time.
-
-        Matches the all-task formula in the official SVC merge_func.py Align /
-        coef_cal_multi_ranks, applied to this checkpoint's target teacher subset.
-        No extra merge scaling, task stacking, driver override, or SVD retry.
-        """
-        stage = "load context/base delta"
-        print(f"SVC: {key}, shape={tuple(context.shape)}, device={self.svc_device}", flush=True)
-        try:
-            base = self.base.get_tensor(key).to(device=self.svc_device, dtype=torch.float32)
-            delta = context.to(device=self.svc_device, dtype=torch.float32).sub_(base)
-            if not torch.isfinite(delta).all():
-                raise FloatingPointError("Non-finite context/base delta")
-            if not torch.count_nonzero(delta).item():
-                self._svc_results[key] = "zero_delta"
-                return context
-            stage = "SVD"
-            u, s, vh = torch.linalg.svd(delta, full_matrices=False)
-            if not all(torch.isfinite(x).all() for x in (u, s, vh)):
-                raise FloatingPointError("Non-finite SVD factors")
-            stage = "merged projection"
-            merged_response = u.T @ delta
-            del delta
-            coefficient_sum = torch.zeros_like(s)
-            for task, teacher in self.teachers.items():
-                stage = f"teacher projection ({task})"
-                task_delta = teacher.get_tensor(key).to(
-                    device=self.svc_device, dtype=torch.float32
-                ).sub_(base)
-                if not torch.isfinite(task_delta).all():
-                    raise FloatingPointError("Non-finite teacher/base delta")
-                response = u.T @ task_delta
-                del task_delta
-                denominator = response.square().sum(dim=1).clamp_min_(self.svc_eps)
-                coefficients = (merged_response * response).sum(dim=1) / denominator
-                if not torch.isfinite(coefficients).all():
-                    raise FloatingPointError("Non-finite SVC projection coefficients")
-                coefficient_sum.add_(coefficients.clamp_min_(self.svc_alpha))
-                del response, denominator, coefficients
-            del merged_response
-            stage = "calibration/reconstruction"
-            if not torch.isfinite(coefficient_sum).all():
-                raise FloatingPointError("Non-finite SVC coefficient sum")
-            calibrated_s = s * (len(self.teachers) / coefficient_sum)
-            output = base.add_((u * calibrated_s.unsqueeze(0)) @ vh)
-            if not torch.isfinite(output).all():
-                raise FloatingPointError("Non-finite SVC weights")
-            stage = "storage conversion"
-            output = output.to(dtype=context.dtype)
-            if not torch.isfinite(output).all():
-                raise FloatingPointError(f"Non-finite SVC weights after conversion to {context.dtype}")
-            output = output.cpu()
-            self._svc_results[key] = "calibrated"
-            return output
-        except (RuntimeError, FloatingPointError) as exc:
-            # Preserve OOM / linalg exception types; never retry on CPU or add noise.
-            exc.add_note(f"SVC key={key}, shape={tuple(context.shape)}, "
-                         f"device={self.svc_device}, stage={stage}")
-            raise
+        output, status = _calibrate_svc_matrix(
+            key, context, lambda: self.base.get_tensor(key),
+            {task: (lambda teacher=teacher: teacher.get_tensor(key))
+             for task, teacher in self.teachers.items()},
+            device=self.svc_device, alpha=self.svc_alpha, eps=self.svc_eps,
+        )
+        self._svc_results[key] = status
+        return output
 
     def svc_report(self) -> dict | None:
         if self.svc_device is None:
@@ -884,9 +684,7 @@ def _save_reports(
     shared_tasks: dict[Slot, tuple[str, ...]],
     channel_selections: ChannelSelections,
     channel_keep_fraction: float,
-    coefficient_mode: str,
     shared_coefficients: dict[Slot, tuple[float, ...]],
-    jvp_diagnostics: list[dict],
     reference_repair_scores: Path | None,
     increment_norms: list[dict[str, int | float]],
     scoring_info: dict,
@@ -940,7 +738,7 @@ def _save_reports(
                 "(sum_rh((f_task-f_base)^2)+eps), 0, 1)"
             ),
         },
-        "coefficient_mode": coefficient_mode,
+        "coefficient_mode": "directional",
         "shared_repair_scale": shared_repair_scale,
         "reference_repair_scores": (str(reference_repair_scores.resolve())
                                     if reference_repair_scores is not None else None),
@@ -1045,27 +843,6 @@ def _save_reports(
         report["semantics"]["non_expert_tensors"] = (
             "svc_on_2d_floating_context_minus_base; otherwise_copy_context"
         )
-    if coefficient_mode == "masked-jvp":
-        report["formulas"]["original_repair_coefficient"] = report["formulas"]["repair_coefficient"]
-        report["formulas"]["repair_coefficient"] = (
-            "clip(<f_teacher(Z)-f_context(Z), J_context[M*(teacher-base)]> / "
-            "(||J_context[M*(teacher-base)]||^2+eps), 0, 1)"
-        )
-        report["jvp_diagnostics"] = _jvp_summary(jvp_diagnostics)
-        report["jvp_diagnostics"].update({
-            "shared_repair_scale": shared_repair_scale,
-            "coefficient_semantics": "fitted coefficients before shared scaling",
-            "increment_comparison": "old and refitted coefficients with identical masks and shared_repair_scale",
-            "linearization_relative_error": (
-                "||f(C+scale*aV)-f(C)-scale*aJ|| / (||f(C+scale*aV)-f(C)|| + eps)"
-            ),
-        })
-        with (output_dir / "connection_jvp_diagnostics.csv").open(
-            "w", encoding="utf-8", newline=""
-        ) as stream:
-            writer = csv.DictWriter(stream, fieldnames=JVP_DIAGNOSTIC_FIELDS)
-            writer.writeheader()
-            writer.writerows(jvp_diagnostics)
     with (output_dir / "conflict_repair_summary.json").open(
         "w", encoding="utf-8"
     ) as f:
@@ -1275,16 +1052,11 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--coefficient-mode", choices=["directional", "masked-jvp"], default="directional",
-        help=("Expert-level repair coefficient: original directional projection (default), "
-              "or FP32 JVP refitting at context along the masked task vector"),
-    )
-    parser.add_argument(
         "--shared-repair-scale", type=float, default=1.0,
         help=("Common finite nonnegative multiplier of the combined masked repair "
-              "at every shared expert, in either coefficient mode (default: 1). "
+              "at every shared expert (default: 1). "
               "0 preserves context at shared experts; values above 1 amplify repairs. "
-              "Does not change expert/channel selection, coefficient fitting, unique "
+              "Does not change expert/channel selection, directional coefficients, unique "
               "teacher copies or score-cache matching"),
     )
     parser.add_argument(
@@ -1377,10 +1149,8 @@ def main() -> None:
                 f"Output directory is not empty: {output_dir}. Pass --overwrite to reuse it."
             )
 
-    # TF32 only affects matmul, so it would silently reduce the two einsum paths
-    # to a 10-bit mantissa: the FP32 probe forward, and the masked JVP, whose
-    # FP32 arithmetic is independent of --compute-dtype. Channel saliency and the
-    # score reductions use no matmul and are unaffected either way.
+    # Keep FP32 probe forwards and optional SVC matmuls at full precision.
+    # Channel saliency and score reductions use no matmul.
     torch.set_float32_matmul_precision("highest")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -1454,14 +1224,7 @@ def main() -> None:
                 args.reference_repair_scores, scores_by_task,
                 selected_by_task, channel_selections,
             )
-        jvp_diagnostics = []
-        if args.coefficient_mode == "masked-jvp":
-            shared_coefficients, jvp_diagnostics = reestimate_masked_jvp_coefficients(
-                base, context, teachers, layouts, shared_tasks, channel_selections,
-                shared_coefficients, probes, device=device, eps=args.eps,
-                shared_repair_scale=args.shared_repair_scale,
-            )
-        print(f"Repair coefficient mode: {args.coefficient_mode}; "
+        print(f"Repair coefficient mode: directional; "
               f"shared repair scale={args.shared_repair_scale}")
         total_slots = sum(layout.num_experts for layout in layouts)
         print(
@@ -1490,8 +1253,8 @@ def main() -> None:
             svc_alpha=args.svc_alpha,
             svc_eps=args.svc_eps,
         )
-        # All input/reference checks, scoring, mask construction and coefficient
-        # fitting have succeeded. Only now begin replacing the output checkpoint.
+        # All input/reference checks, scoring and mask construction have succeeded.
+        # Only now begin replacing the output checkpoint.
         # Invalidate completion before cleanup, which can itself fail partway.
         (output_dir / "repair_complete.json").unlink(missing_ok=True)
         if args.overwrite:
@@ -1500,6 +1263,7 @@ def main() -> None:
             # An explicitly colocated score cache may have created this directory
             # since the read-only destination check above.
             output_dir.mkdir(parents=True, exist_ok=True)
+        # Remove stale diagnostics when overwriting a legacy masked-JVP output.
         (output_dir / "connection_jvp_diagnostics.csv").unlink(missing_ok=True)
         save_selected_checkpoint(
             repaired_state,
@@ -1519,9 +1283,7 @@ def main() -> None:
             shared_tasks=shared_tasks,
             channel_selections=channel_selections,
             channel_keep_fraction=args.channel_keep_fraction,
-            coefficient_mode=args.coefficient_mode,
             shared_coefficients=shared_coefficients,
-            jvp_diagnostics=jvp_diagnostics,
             reference_repair_scores=args.reference_repair_scores,
             increment_norms=repaired_state.increment_norm_report(),
             svc_report=repaired_state.svc_report(),
@@ -1542,10 +1304,8 @@ def main() -> None:
     with (output_dir / "repair_complete.json").open("w", encoding="utf-8") as f:
         completion = {
             "status": "complete",
-            "repair_mode": ("copy_unique_sum_shared_connection_jvp"
-                            if args.coefficient_mode == "masked-jvp"
-                            else "copy_unique_sum_shared_connection"),
-            "coefficient_mode": args.coefficient_mode,
+            "repair_mode": "copy_unique_sum_shared_connection",
+            "coefficient_mode": "directional",
             "shared_repair_scale": args.shared_repair_scale,
         }
         if args.apply_svc:
