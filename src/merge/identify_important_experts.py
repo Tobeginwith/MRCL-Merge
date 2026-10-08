@@ -12,6 +12,9 @@ The lowest-scoring fraction of experts in each layer is restored from the
 base checkpoint. All other parameters remain exactly those of the task expert
 checkpoint. The result is saved as a complete HuggingFace safetensors model.
 
+With --random-selection, skip scoring and uniformly sample the same number of
+experts per layer without replacement, using --seed for reproducibility.
+
 The script targets the Qwen3-VL-30B-A3B-Instruct packed expert layout:
 
     ...mlp.experts.gate_up_proj  [num_experts, hidden, 2 * intermediate]
@@ -509,6 +512,31 @@ def select_experts_to_revert(
     return selected
 
 
+def select_random_experts_to_revert(
+    layouts: list[ExpertLayerLayout],
+    revert_fraction: float,
+    seed: int,
+) -> dict[str, list[int]]:
+    if not 0.0 <= revert_fraction <= 1.0:
+        raise ValueError(
+            f"revert_fraction must be in [0, 1], got {revert_fraction}"
+        )
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    selected: dict[str, list[int]] = {}
+    for layout in layouts:
+        num_revert = math.floor(layout.num_experts * revert_fraction)
+        ranked = torch.randperm(
+            layout.num_experts, generator=generator, device="cpu"
+        )
+        selected[layout.prefix] = sorted(ranked[:num_revert].tolist())
+        print(
+            f"  {layout.label}: randomly reverting "
+            f"{num_revert}/{layout.num_experts} experts"
+        )
+    return selected
+
+
 def _contiguous_ranges(indices: list[int]) -> list[tuple[int, int]]:
     if not indices:
         return []
@@ -711,7 +739,7 @@ def save_selected_checkpoint(
 def save_selection_reports(
     output_dir: Path,
     layouts: list[ExpertLayerLayout],
-    scores_by_layer: dict[str, list[float]],
+    scores_by_layer: dict[str, list[float]] | None,
     reverted_experts: dict[str, list[int]],
     *,
     base_dir: Path,
@@ -720,8 +748,9 @@ def save_selection_reports(
     seed: int,
     revert_fraction: float,
     eps: float,
-    device: torch.device,
-    compute_dtype: torch.dtype,
+    device: torch.device | None,
+    compute_dtype: torch.dtype | None,
+    random_selection: bool = False,
 ) -> None:
     layers_json: list[dict[str, Any]] = []
     for layout in layouts:
@@ -734,7 +763,7 @@ def save_selection_reports(
                 "num_experts": layout.num_experts,
                 "hidden_size": layout.hidden_size,
                 "intermediate_size": layout.intermediate_size,
-                "scores": scores_by_layer[layout.prefix],
+                "scores": None if random_selection else scores_by_layer[layout.prefix],
                 "reverted_expert_ids": sorted(reverted),
                 "kept_expert_ids": [
                     e for e in range(layout.num_experts) if e not in reverted
@@ -743,21 +772,26 @@ def save_selection_reports(
         )
 
     report = {
-        "method": "data_free_functional_drift",
-        "formula": (
+        "method": "random_selection" if random_selection else "data_free_functional_drift",
+        "formula": None if random_selection else (
             "mean_r(||f_task(z_r)-f_base(z_r)||_2^2 / "
             "(||f_base(z_r)||_2^2+eps))"
         ),
-        "probe_distribution": "Rademacher({-1,+1})",
+        "probe_distribution": None if random_selection else "Rademacher({-1,+1})",
         "base_model": str(base_dir.resolve()),
         "expert_model": str(expert_dir.resolve()),
-        "num_probes": num_probes,
+        "num_probes": None if random_selection else num_probes,
         "seed": seed,
         "revert_fraction": revert_fraction,
-        "selection_rule": "lowest scores independently within each layer",
-        "eps": eps,
-        "device": str(device),
-        "compute_dtype": str(compute_dtype).removeprefix("torch."),
+        "selection_rule": (
+            "uniform random sampling without replacement independently within each layer"
+            if random_selection else "lowest scores independently within each layer"
+        ),
+        "eps": None if random_selection else eps,
+        "device": None if random_selection else str(device),
+        "compute_dtype": (
+            None if random_selection else str(compute_dtype).removeprefix("torch.")
+        ),
         "layers": layers_json,
     }
     json_path = output_dir / "functional_drift_selection.json"
@@ -773,13 +807,17 @@ def save_selection_reports(
         )
         for layout in layouts:
             reverted = set(reverted_experts[layout.prefix])
-            for expert_id, score in enumerate(scores_by_layer[layout.prefix]):
+            for expert_id in range(layout.num_experts):
+                score = (
+                    "" if random_selection
+                    else f"{scores_by_layer[layout.prefix][expert_id]:.17g}"
+                )
                 writer.writerow(
                     [
                         layout.layer_index,
                         layout.label,
                         expert_id,
-                        f"{score:.17g}",
+                        score,
                         "revert_to_base" if expert_id in reverted else "keep_task",
                     ]
                 )
@@ -790,7 +828,8 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Use data-free SwiGLU functional drift to keep the most changed "
-            "internal MoE experts and restore the rest from the base model."
+            "internal MoE experts and restore the rest from the base model, "
+            "or use --random-selection for a random selection ablation."
         )
     )
     parser.add_argument("--base", required=True, help="Local base model directory")
@@ -808,14 +847,24 @@ def _parse_args() -> argparse.Namespace:
         help="Number of shared Rademacher hidden vectors (default: 16)",
     )
     parser.add_argument(
-        "--seed", type=int, default=42, help="Probe RNG seed (default: 42)"
+        "--seed", type=int, default=42,
+        help="Probe or random-selection RNG seed (default: 42)"
+    )
+    parser.add_argument(
+        "--random-selection",
+        action="store_true",
+        help=(
+            "Randomly restore experts per layer without scoring; uses --seed. "
+            "Ignores probe, scoring device/dtype, batch-size and eps options."
+        ),
     )
     parser.add_argument(
         "--revert-fraction",
         type=float,
         default=0.5,
         help=(
-            "Lowest-scoring fraction restored to base independently per layer "
+            "Fraction restored to base independently per layer (lowest scores "
+            "unless --random-selection is enabled) "
             "(default: 0.5)"
         ),
     )
@@ -892,9 +941,15 @@ def main() -> None:
         )
     _prepare_output_dir(output_dir, args.overwrite)
 
-    device = _resolve_device(args.device)
-    compute_dtype = _resolve_compute_dtype(args.compute_dtype, device)
-    print(f"Scoring device={device}, compute_dtype={compute_dtype}")
+    device = None
+    compute_dtype = None
+    if args.random_selection:
+        print(f"Selection mode=random_selection, seed={args.seed}; scoring skipped")
+    else:
+        device = _resolve_device(args.device)
+        compute_dtype = _resolve_compute_dtype(args.compute_dtype, device)
+        print(f"Selection mode=data_free_functional_drift; scoring device={device}, "
+              f"compute_dtype={compute_dtype}")
 
     with SafetensorCheckpoint(base_dir) as base, SafetensorCheckpoint(
         expert_dir
@@ -903,24 +958,30 @@ def main() -> None:
         validate_base_compatibility(base, task, layouts)
         hidden_size = layouts[0].hidden_size
         print(
-            f"Discovered {len(layouts)} MoE layers; hidden_size={hidden_size}; "
-            f"shared probes R={args.num_probes}, seed={args.seed}"
+            f"Discovered {len(layouts)} MoE layers; hidden_size={hidden_size}"
         )
 
-        probes = make_rademacher_probes(args.num_probes, hidden_size, args.seed)
-        scores = score_expert_layers(
-            base,
-            task,
-            layouts,
-            probes,
-            device=device,
-            compute_dtype=compute_dtype,
-            expert_batch_size=args.expert_batch_size,
-            eps=args.eps,
-        )
-        reverted = select_experts_to_revert(
-            layouts, scores, args.revert_fraction
-        )
+        scores = None
+        if args.random_selection:
+            reverted = select_random_experts_to_revert(
+                layouts, args.revert_fraction, args.seed
+            )
+        else:
+            print(f"Shared probes R={args.num_probes}, seed={args.seed}")
+            probes = make_rademacher_probes(args.num_probes, hidden_size, args.seed)
+            scores = score_expert_layers(
+                base,
+                task,
+                layouts,
+                probes,
+                device=device,
+                compute_dtype=compute_dtype,
+                expert_batch_size=args.expert_batch_size,
+                eps=args.eps,
+            )
+            reverted = select_experts_to_revert(
+                layouts, scores, args.revert_fraction
+            )
         selected_state = SelectedCheckpoint(base, task, layouts, reverted)
         save_selected_checkpoint(
             selected_state,
@@ -944,6 +1005,7 @@ def main() -> None:
             eps=args.eps,
             device=device,
             compute_dtype=compute_dtype,
+            random_selection=args.random_selection,
         )
 
     print(f"Done. Selected checkpoint -> {output_dir}")
