@@ -1,8 +1,18 @@
 #!/bin/bash
 set -euo pipefail
-LOG_FILE="./results/Qwen3-VL-2B/Zeroshot_OOD/eval.log"
-mkdir -p ./results/Qwen3-VL-2B/Zeroshot_OOD
-exec > >(tee -a "$LOG_FILE") 2>&1
+
+if [ "$#" -lt 4 ] || [ "$#" -gt 5 ]; then
+    echo "Usage: $0 MODEL_NAME MODEL_LABEL TEST_FILE_BASE RESULTS_DIR_BASE [TASK_IDS]" >&2
+    echo "TASK_IDS is a quoted, space- or comma-separated list from 1 to 10; default: all tasks" >&2
+    exit 2
+fi
+
+MODEL_NAME=$1
+MODEL_LABEL=$2
+TEST_FILE_BASE=$3
+RESULTS_DIR_BASE=$4
+TASK_IDS=${5-"1 2 3 4 5 6 7 8 9 10"}
+
 DATA=(
     "MMMU_pro"
     "MathVerse"
@@ -16,13 +26,34 @@ DATA=(
     "MathVista"
 )
 
-MODEL_NAME=/your_model_path/Qwen/Qwen3-VL-2B-Instruct
-TEST_FILE_BASE=/your_data_path/Eval_OOD_Datasets
-RESULTS_DIR_BASE=./results/Qwen3-VL-2B/Zeroshot_OOD
+# Task IDs are one-based indices into DATA; accept "1 4 6" or "1,4,6".
+read -r -a SELECTED_TASK_IDS <<< "${TASK_IDS//,/ }"
+if [ "${#SELECTED_TASK_IDS[@]}" -eq 0 ]; then
+    echo "TASK_IDS must contain at least one task ID." >&2
+    exit 2
+fi
+
+SELECTED_DATASETS=()
+for TASK_ID in "${SELECTED_TASK_IDS[@]}"; do
+    if ! [[ "$TASK_ID" =~ ^([1-9]|10)$ ]]; then
+        echo "TASK_IDS only accepts values from 1 to 10: ${TASK_IDS}" >&2
+        exit 2
+    fi
+    SELECTED_DATASETS+=("${DATA[$((TASK_ID - 1))]}")
+done
+
+if ! [[ "$MODEL_LABEL" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "$MODEL_LABEL" == "." || "$MODEL_LABEL" == ".." ]]; then
+    echo "MODEL_LABEL must be a directory name containing only letters, digits, dot, underscore, and hyphen (not . or ..)." >&2
+    exit 2
+fi
+
+LOG_FILE="${RESULTS_DIR_BASE}/${MODEL_LABEL}/eval.log"
+mkdir -p "${RESULTS_DIR_BASE}/${MODEL_LABEL}"
+exec > >(tee -a "$LOG_FILE") 2>&1
 
 BATCH_SIZE=2048
 DISABLE_FLASH_ATTN2=true
-for dataset in "${DATA[@]}"; do
+for dataset in "${SELECTED_DATASETS[@]}"; do
     if [ "${dataset}" == "POPE" ]; then
         TEST_FILE="${TEST_FILE_BASE}/POPE/coco_pope.json"
         MEDIA_DIR="${TEST_FILE_BASE}/POPE/coco/image"
@@ -35,7 +66,7 @@ for dataset in "${DATA[@]}"; do
         TEST_FILE="${TEST_FILE_BASE}/${dataset}"
         MEDIA_DIR=""
     fi
-    RESULTS_DIR="${RESULTS_DIR_BASE}/${dataset}"
+    RESULTS_DIR="${RESULTS_DIR_BASE}/${MODEL_LABEL}/${dataset}"
     if [ "${dataset}" == "MMMU_pro" ]; then
         Options=(
                 "standard (4 options)"
