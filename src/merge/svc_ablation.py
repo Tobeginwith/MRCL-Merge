@@ -5,6 +5,8 @@ Ordinary 2D tensors use their stored orientation. Qwen packed MoE experts are
 split into individual gate/up/down matrices, transposed from [input, output]
 to [output, input] for left-space SVC, then restored to their original layout.
 Other tensor ranks and non-floating tensors are copied from the context model.
+With --moe-only, only packed mlp.experts.gate_up_proj and mlp.experts.down_proj
+are calibrated; all non-expert tensors are copied from the context model.
 This script performs no expert selection or connection repair.
 
 SVC (arXiv:2602.05536v2) uses context-minus-base and teacher-minus-base updates
@@ -63,6 +65,7 @@ class SVCCalibratedCheckpoint:
         device: torch.device,
         alpha: float = 1.0,
         eps: float = 1e-12,
+        moe_only: bool = False,
     ) -> None:
         _validate_svc_options(alpha, eps)
         if device.type != "cuda" or not torch.cuda.is_available():
@@ -72,6 +75,7 @@ class SVCCalibratedCheckpoint:
         _validate_checkpoint_compatibility(base, [context, *teachers.values()])
         self.base, self.context, self.teachers = base, context, teachers
         self.device, self.alpha, self.eps = device, alpha, eps
+        self.moe_only = moe_only
         packed_keys = {
             key for key in context.keys()
             if key.endswith((".mlp.experts.gate_up_proj", ".mlp.experts.down_proj"))
@@ -102,7 +106,8 @@ class SVCCalibratedCheckpoint:
     def get_tensor(self, key: str) -> torch.Tensor:
         context = self.context.get_tensor(key)
         layout = self.expert_key_layout.get(key)
-        if not context.is_floating_point() or (layout is None and context.ndim != 2):
+        if (not context.is_floating_point()
+                or (layout is None and (self.moe_only or context.ndim != 2))):
             self._copied_keys.add(key)
             return context
         if layout is not None:
@@ -162,7 +167,11 @@ class SVCCalibratedCheckpoint:
                                 for task, teacher in self.teachers.items()},
             "alpha": self.alpha, "eps": self.eps, "device": str(self.device),
             "compute_dtype": "float32", "svd_driver": "default", "tf32": False,
-            "parameter_scope": "all_floating_2d_tensors_and_individual_packed_expert_gate_up_down",
+            "moe_only": self.moe_only,
+            "parameter_scope": (
+                "individual_packed_expert_gate_up_down" if self.moe_only else
+                "all_floating_2d_tensors_and_individual_packed_expert_gate_up_down"
+            ),
             "other_parameters": "copy_context",
             "packed_orientation": "transpose_to_output_input_then_restore",
             "merged_delta": "context_minus_base; no_additional_scaling",
@@ -184,6 +193,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--target-tasks", "--target-task", dest="target_tasks", nargs="+",
                         help="Teacher subset used for SVC; defaults to all tasks")
     parser.add_argument("--output", required=True, help="Output HF checkpoint")
+    parser.add_argument("--moe-only", action="store_true",
+                        help="Calibrate only packed mlp.experts.gate_up_proj and "
+                             "mlp.experts.down_proj, separately per expert and gate/up/down; "
+                             "copy all other tensors from context (default: disabled)")
     parser.add_argument("--svc-alpha", type=float, default=1.0,
                         help="Projection coefficient floor in (0, 1]; 1 suppresses only (default: 1)")
     parser.add_argument("--svc-eps", type=float, default=1e-12,
@@ -227,14 +240,16 @@ def main() -> None:
     if args.save_processor and not processor_source.is_dir():
         raise FileNotFoundError(f"Processor source directory not found: {processor_source}")
 
-    print(f"SVC device={device}, dtype=float32, alpha={args.svc_alpha}, target_tasks={target_tasks}", flush=True)
+    print(f"SVC device={device}, dtype=float32, alpha={args.svc_alpha}, "
+          f"moe_only={args.moe_only}, target_tasks={target_tasks}", flush=True)
     with ExitStack() as stack:
         base = stack.enter_context(SafetensorCheckpoint(base_dir))
         context = stack.enter_context(SafetensorCheckpoint(context_dir))
         teachers = {task: stack.enter_context(SafetensorCheckpoint(teachers_by_name[task]))
                     for task in target_tasks}
         state = SVCCalibratedCheckpoint(base, context, teachers, device=device,
-                                        alpha=args.svc_alpha, eps=args.svc_eps)
+                                        alpha=args.svc_alpha, eps=args.svc_eps,
+                                        moe_only=args.moe_only)
         # All input metadata and output options are checked before replacement begins.
         (output_dir / "svc_complete.json").unlink(missing_ok=True)
         _prepare_output_dir(output_dir, args.overwrite)
