@@ -6,6 +6,7 @@ Supported methods:
   - ta: Task Arithmetic
         θ = θ_base + Σ λ_i · (θ_teacher_i − θ_base)
   - ties: TIES Merging
+  - cabs: Conflict-Aware and Balanced Sparsification (minimum-overlap variant)
   - tsvm: Task Singular Vector Merging with randomized low-rank task SVD and rank truncation
   - wudi: WUDI linear-weight merging with streamed Gram statistics and Adam
   - orthomerge_g: OrthoMerge-G with TA residual merging
@@ -90,6 +91,18 @@ inverse Cayley mapping, and magnitude-corrected merging. Scale applies ONLY to
 the summed residuals; 1/num_teachers averages them, and scale=0 retains rotation.
 Nonmatrix floats use TA (summed task deltas). All floating computation uses CUDA
 FP32. Standard SVD and solve failures propagate, including OOM, without fallback.
+
+CABS follows https://arxiv.org/abs/2503.01874 (Appendix B.3), extending the
+low-overlap rule to the union of earlier teachers' selected positions.
+Use: python src/merge/merge.py cabs --base BASE --teachers T1 T2
+     --device cuda:0 --cabs-n 64 --cabs-m 256 --scale 1.0 --output OUTPUT
+Process teachers in input order. Per group, take the largest unused updates;
+if fewer than n positions remain, fill from the largest occupied updates.
+All floating tensors participate, flattened in stored order. Each packed expert
+projection is grouped separately without transposition; tails keep min(n,length).
+Selected zero updates also consume positions. No density rescaling or averaging.
+CUDA FP32 only; OOM propagates without retry or CPU fallback. This follows the
+paper's budget-preserving rule, not the author's strict-mask MergeKit variant.
 
 Loading strategy:
   - Index safetensors metadata without loading complete checkpoints.
@@ -1930,6 +1943,184 @@ def merge_ram_plus(
     }
 
 
+def _cabs_prune_blocks_(delta: torch.Tensor, occupied: torch.Tensor, n: int) -> None:
+    """Prune FP32 rows in place, preferring unused positions before magnitude.
+
+    Each row is one complete group (or the final shorter group). Selected zero
+    updates also consume positions. Ties follow CUDA topk, as in the source code.
+    """
+    keep = min(n, delta.shape[1])
+    if keep == delta.shape[1]:
+        occupied.fill_(True)
+        return
+    magnitude = delta.abs()
+    free_values, free_indices = magnitude.masked_fill(occupied, -torch.inf).topk(keep, dim=1)
+    used_indices = magnitude.masked_fill(~occupied, -torch.inf).topk(keep, dim=1).indices
+    free_count = torch.isfinite(free_values).sum(dim=1, keepdim=True)
+    # The first free_count ranks use free indices; remaining ranks fill from
+    # the largest occupied updates. No magnitude offset or FP32 rounding trick.
+    rank = torch.arange(keep, device=delta.device).unsqueeze(0)
+    used_rank = (rank - free_count).clamp_min_(0)
+    indices = torch.where(rank < free_count, free_indices, used_indices.gather(1, used_rank))
+    selected = torch.zeros_like(occupied).scatter_(1, indices, True)
+    delta.masked_fill_(~selected, 0.0)
+    occupied.logical_or_(selected)
+
+
+class _CABSRuntime(_TSVMRuntime):
+    """Sequential, minimum-overlap CABS; only scalar diagnostics persist.
+
+    Extends the paper's two-task low-overlap rule to the union of earlier masks.
+    Unlike the author's strict-mask MergeKit variant, occupied positions are
+    eligible when necessary to preserve each teacher's n:m position budget.
+    """
+
+    _BLOCKS_PER_CHUNK = 4096
+
+    def __init__(self, *, num_teachers: int, scale: float, device: str | torch.device,
+                 n: int = 64, m: int = 256):
+        for name, value in (("n", n), ("m", m)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"CABS {name} must be an integer")
+        if not 0 <= n <= m or m <= 0:
+            raise ValueError("CABS requires 0 <= n <= m and m > 0")
+        resolved = torch.device("cuda:0" if str(device) == "auto" else device)
+        if resolved.type != "cuda":
+            raise ValueError("CABS requires a CUDA device; no CPU fallback")
+        if not torch.cuda.is_available():
+            raise ValueError("CABS requested CUDA, but CUDA is unavailable")
+        if resolved.index is not None and not 0 <= resolved.index < torch.cuda.device_count():
+            raise ValueError(f"Invalid CABS CUDA device index: {resolved.index}")
+        try:
+            super().__init__(num_teachers=num_teachers, scale=scale, device=resolved)
+        except ValueError as exc:
+            exc.args = (str(exc).replace("TSVM", "CABS"),)
+            raise
+        self.n, self.m = n, m
+        self.copied_parts = 0
+        self.tail_parts = 0
+
+    @torch.inference_mode()
+    def merge(self, base_tensor: torch.Tensor,
+              teacher_tensor_factory: Callable[[], Iterable[torch.Tensor]],
+              identity: str) -> torch.Tensor:
+        if (not torch.is_floating_point(base_tensor) or self.n == 0
+                or self.scale == 0 or base_tensor.numel() == 0):
+            self.copied_parts += 1
+            self.completed_parts += 1
+            return base_tensor.detach().to(device="cpu", copy=True)
+        started = time.perf_counter()
+        stage = "load base"
+        try:
+            shape = tuple(base_tensor.shape)
+            base = base_tensor.to(device=self.device, dtype=torch.float32, copy=True).reshape(-1)
+            if not torch.isfinite(base).all():
+                raise FloatingPointError("Non-finite CABS base weights")
+            merged_delta = torch.zeros_like(base)
+            occupied = torch.zeros_like(base, dtype=torch.bool)
+            full_length = base.numel() // self.m * self.m
+            chunk_size = self._BLOCKS_PER_CHUNK * self.m
+            count = 0
+            for tensor in teacher_tensor_factory():
+                task = count
+                stage = f"teacher={task}, load delta"
+                if task >= self.num_teachers or tuple(tensor.shape) != shape:
+                    raise ValueError("Incompatible CABS teacher count or shape")
+                delta = tensor.to(device=self.device, dtype=torch.float32, copy=True).reshape(-1)
+                delta.sub_(base)
+                del tensor
+                if not torch.isfinite(delta).all():
+                    raise FloatingPointError("Non-finite CABS task vector")
+                stage = f"teacher={task}, n:m selection"
+                for start in range(0, full_length, chunk_size):
+                    end = min(start + chunk_size, full_length)
+                    _cabs_prune_blocks_(delta[start:end].view(-1, self.m),
+                                       occupied[start:end].view(-1, self.m), self.n)
+                if full_length < base.numel():
+                    _cabs_prune_blocks_(delta[full_length:].view(1, -1),
+                                       occupied[full_length:].view(1, -1), self.n)
+                stage = f"teacher={task}, accumulation"
+                merged_delta.add_(delta)
+                del delta
+                count += 1
+            if count != self.num_teachers:
+                raise ValueError(f"CABS expected {self.num_teachers} teachers, got {count}")
+            stage = "reconstruction"
+            base.add_(merged_delta, alpha=self.scale)
+            del merged_delta, occupied
+            if not torch.isfinite(base).all():
+                raise FloatingPointError("Non-finite CABS merged weights")
+            stage = "storage conversion"
+            output = base.to(dtype=base_tensor.dtype).reshape(shape)
+            if not torch.isfinite(output).all():
+                raise FloatingPointError(f"Non-finite CABS weights after conversion to {base_tensor.dtype}")
+            output = output.cpu()
+        except (RuntimeError, ValueError, FloatingPointError) as exc:
+            # Preserve CUDA OOM identity/type and traceback, with no retry.
+            exc.add_note(f"CABS key={identity}, shape={tuple(base_tensor.shape)}, "
+                         f"device={self.device}, stage={stage}")
+            raise
+        self.completed_parts += 1
+        self.cuda_parts += 1
+        self.tail_parts += int(full_length < base_tensor.numel())
+        self.elapsed_seconds += time.perf_counter() - started
+        return output
+
+    def summary(self) -> dict:
+        return {
+            "method": "cabs", "status": "complete", "variant": "sequential_minimum_union_overlap",
+            "num_teachers": self.num_teachers, "scale": self.scale,
+            "n": self.n, "m": self.m, "density": self.n / self.m,
+            "teacher_order": "input_order",
+            "selection_rule": "unused_positions_by_magnitude_then_occupied_positions_by_magnitude",
+            "occupied_rule": "union_of_selected_positions_including_zero_updates",
+            "grouping": "flatten_stored_order_per_tensor_or_individual_expert_gate_up_down; no_transpose",
+            "tail_rule": "keep_min(n,tail_length); no_cross_tensor_groups",
+            "tie_rule": "torch.topk; no_cross_device_tie_order_guarantee",
+            "parameter_scope": "all_floating_tensors", "nonfloating_rule": "copy_base",
+            "merge_rule": "base + scale * sum(pruned_teacher_minus_base); no_density_rescaling",
+            "device": str(self.device), "compute_dtype": "float32", "output_dtype": "base_storage_dtype",
+            "blocks_per_chunk": self._BLOCKS_PER_CHUNK,
+            "completed_parts": self.completed_parts, "cuda_parts": self.cuda_parts,
+            "copied_parts": self.copied_parts, "parts_with_tail_groups": self.tail_parts,
+            "elapsed_compute_seconds": self.elapsed_seconds,
+            "cuda_peak_allocated_bytes": torch.cuda.max_memory_allocated(self.device),
+            "torch_version": torch.__version__, "cuda_version": torch.version.cuda,
+        }
+
+
+def merge_cabs(
+    base_state_dict: SafetensorCheckpoint | dict[str, torch.Tensor],
+    teacher_state_dicts: list[SafetensorCheckpoint | dict[str, torch.Tensor]],
+    scale: float = 1.0,
+    *,
+    device: str | torch.device = "auto",
+    n: int = 64,
+    m: int = 256,
+) -> _StreamingMergedStateDict | dict[str, torch.Tensor]:
+    """CUDA CABS on all floats, processing teachers in the supplied order."""
+    runtime = _CABSRuntime(num_teachers=len(teacher_state_dicts), scale=scale,
+                           device=device, n=n, m=m)
+    if isinstance(base_state_dict, SafetensorCheckpoint) and not all(
+            isinstance(sd, SafetensorCheckpoint) for sd in teacher_state_dicts):
+        raise TypeError("Streaming CABS requires safetensors readers for all teachers")
+    _validate_compatible_state_dicts(
+        [base_state_dict, *teacher_state_dicts],
+        ["base", *(f"teacher_{i}" for i in range(len(teacher_state_dicts)))],
+    )
+    if isinstance(base_state_dict, SafetensorCheckpoint):
+        return _StreamingMergedStateDict(
+            base_state_dict, teacher_state_dicts, method="cabs", scale=scale, cabs=runtime,
+        )
+    packed = _packed_expert_layouts(base_state_dict, teacher_state_dicts)
+    return {
+        key: _merge_state_tensor(
+            key, base_state_dict, teacher_state_dicts, "cabs", scale, 1.0, packed, cabs=runtime,
+        )
+        for key in base_state_dict
+    }
+
+
 def _packed_expert_layouts(
     base: SafetensorCheckpoint | dict[str, torch.Tensor],
     teachers: list[SafetensorCheckpoint | dict[str, torch.Tensor]],
@@ -1983,6 +2174,7 @@ def _merge_state_tensor(
     iso_cts: _IsoCTSRuntime | None = None,
     ram_plus: _RAMPlusRuntime | None = None,
     orthomerge_g: _OrthoMergeGRuntime | None = None,
+    cabs: _CABSRuntime | None = None,
 ) -> torch.Tensor:
     """Dispatch both in-memory and streaming merges through the same partitions."""
     base_tensor = _get_state_tensor(base, key)
@@ -2004,7 +2196,7 @@ def _merge_state_tensor(
     def merge_part(index: tuple[slice, ...] | None) -> torch.Tensor:
         def teacher_parts() -> Iterable[torch.Tensor]:
             return _teacher_parts(teachers, key, index,
-                                  method in ("tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g"))
+                                  method in ("tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g", "cabs"))
 
         part = base_tensor if index is None else base_tensor[index]
         if method in ("ta", "ties"):
@@ -2020,8 +2212,8 @@ def _merge_state_tensor(
                 exc.args = (f"{method.upper()} OOM at {identity}, shape={tuple(part.shape)}, "
                             f"device={compute_device}: {exc}",)
                 raise
-        if method in ("tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g"):
-            runtime = {"tsvm": tsvm, "wudi": wudi, "dc": dc, "iso_c": iso_c, "iso_cts": iso_cts, "ram_plus": ram_plus, "orthomerge_g": orthomerge_g}[method]
+        if method in ("tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g", "cabs"):
+            runtime = {"tsvm": tsvm, "wudi": wudi, "dc": dc, "iso_c": iso_c, "iso_cts": iso_cts, "ram_plus": ram_plus, "orthomerge_g": orthomerge_g, "cabs": cabs}[method]
             if runtime is None:
                 raise ValueError(f"Missing {method.upper()} runtime")
             identity = key
@@ -2036,15 +2228,15 @@ def _merge_state_tensor(
             return result.unsqueeze(0) if index is not None else result
         raise ValueError(f"Unsupported merge method: {method}")
 
-    if method in ("tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g"):
+    if method in ("tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g", "cabs"):
         print(f"{method.upper()} merging {key}, shape={expected}", flush=True)
     if key not in packed:
         return merge_part(None)
     experts, intermediate, is_gate_up = packed[key]
-    output = torch.empty_like(base_tensor, device="cpu") if method in ("ta", "ties", "tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g") else torch.empty_like(base_tensor)
+    output = torch.empty_like(base_tensor, device="cpu") if method in ("ta", "ties", "tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g", "cabs") else torch.empty_like(base_tensor)
     for index in _expert_part_indices(packed[key]):
         expert = index[0].start
-        if (method in ("tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g") and expert % 16 == 0
+        if (method in ("tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g", "cabs") and expert % 16 == 0
                 and (not is_gate_up or index[2].start == 0)):
             print(f"  {method.upper()} expert {expert + 1}/{experts}", flush=True)
         output[index].copy_(merge_part(index))
@@ -2070,6 +2262,7 @@ class _StreamingMergedStateDict:
         iso_cts: _IsoCTSRuntime | None = None,
         ram_plus: _RAMPlusRuntime | None = None,
         orthomerge_g: _OrthoMergeGRuntime | None = None,
+        cabs: _CABSRuntime | None = None,
     ):
         self.base_state_dict = base_state_dict
         self.teacher_state_dicts = teacher_state_dicts
@@ -2084,6 +2277,7 @@ class _StreamingMergedStateDict:
         self.iso_cts = iso_cts
         self.ram_plus = ram_plus
         self.orthomerge_g = orthomerge_g
+        self.cabs = cabs
         self.packed_layouts = _packed_expert_layouts(base_state_dict, teacher_state_dicts)
 
     def keys(self) -> list[str]:
@@ -2098,7 +2292,7 @@ class _StreamingMergedStateDict:
     def get_tensor(self, key: str) -> torch.Tensor:
         return _merge_state_tensor(
             key, self.base_state_dict, self.teacher_state_dicts,
-            self.method, self.scale, self.density, self.packed_layouts, compute_device=self.compute_device, tsvm=self.tsvm, wudi=self.wudi, dc=self.dc, iso_c=self.iso_c, iso_cts=self.iso_cts, ram_plus=self.ram_plus, orthomerge_g=self.orthomerge_g,
+            self.method, self.scale, self.density, self.packed_layouts, compute_device=self.compute_device, tsvm=self.tsvm, wudi=self.wudi, dc=self.dc, iso_c=self.iso_c, iso_cts=self.iso_cts, ram_plus=self.ram_plus, orthomerge_g=self.orthomerge_g, cabs=self.cabs,
         )
 
 
@@ -2238,7 +2432,7 @@ def save_merged_model_hf(
     if (isinstance(merged_state_dict, _StreamingMergedStateDict)
             and (merged_state_dict.wudi is not None or merged_state_dict.dc is not None
                  or merged_state_dict.iso_c is not None or merged_state_dict.iso_cts is not None or merged_state_dict.ram_plus is not None
-                 or merged_state_dict.orthomerge_g is not None)):
+                 or merged_state_dict.orthomerge_g is not None or merged_state_dict.cabs is not None)):
         _parse_size_bytes(max_shard_size)
         input_paths = [merged_state_dict.base_state_dict.model_dir,
                        *(sd.model_dir for sd in merged_state_dict.teacher_state_dicts)]
@@ -2247,6 +2441,7 @@ def save_merged_model_hf(
     if template_dir.resolve() == output_dir.resolve():
         raise ValueError("Output directory must differ from the base/template directory")
     output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "cabs_merge_summary.json").unlink(missing_ok=True)
     _remove_stale_safetensors(output_dir)
     (output_dir / "tsvm_merge_summary.json").unlink(missing_ok=True)
     (output_dir / "wudi_merge_summary.json").unlink(missing_ok=True)
@@ -2303,7 +2498,7 @@ def save_merged_model_hf(
     processor.save_pretrained(str(output_dir))
     print("Processor saved.")
 
-    runtime = (merged_state_dict.tsvm or merged_state_dict.wudi or merged_state_dict.dc or merged_state_dict.iso_c or merged_state_dict.iso_cts or merged_state_dict.ram_plus or merged_state_dict.orthomerge_g
+    runtime = (merged_state_dict.tsvm or merged_state_dict.wudi or merged_state_dict.dc or merged_state_dict.iso_c or merged_state_dict.iso_cts or merged_state_dict.ram_plus or merged_state_dict.orthomerge_g or merged_state_dict.cabs
                if isinstance(merged_state_dict, _StreamingMergedStateDict) else None)
     if runtime is not None:
         report = runtime.summary()
@@ -2317,11 +2512,11 @@ def save_merged_model_hf(
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Merge teacher models (TA / TIES / TSVM / WUDI / DC-Merge / Iso-C / Iso-CTS / RAM+ / OrthoMerge-G).")
+    parser = argparse.ArgumentParser(description="Merge teacher models (TA / TIES / TSVM / WUDI / DC-Merge / Iso-C / Iso-CTS / RAM+ / OrthoMerge-G / CABS).")
     parser.add_argument(
         "method",
-        choices=["ta", "ties", "tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g"],
-        help="ta = task arithmetic; ties = TIES merging; tsvm = task singular vector merging; wudi = WUDI linear-weight merging; dc = FFT DC-Merge; iso_c = isotropic common-subspace merging; iso_cts = common and task-specific isotropic merging; ram_plus = reinforced agent merging; orthomerge_g = global orthogonal merging + TA",
+        choices=["ta", "ties", "tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g", "cabs"],
+        help="ta = task arithmetic; ties = TIES merging; tsvm = task singular vector merging; wudi = WUDI linear-weight merging; dc = FFT DC-Merge; iso_c = isotropic common-subspace merging; iso_cts = common and task-specific isotropic merging; ram_plus = reinforced agent merging; orthomerge_g = global orthogonal merging + TA; cabs = conflict-aware balanced sparsification",
     )
     parser.add_argument(
         "--teachers",
@@ -2349,7 +2544,7 @@ def _parse_args() -> argparse.Namespace:
         "--scale",
         type=float,
         default=1.0,
-        help="Global scale applied to the summed TA task vector or merged TIES/TSVM/WUDI/DC/Iso-C/Iso-CTS/RAM+ task vector; OrthoMerge-G scales only residuals (default: 1.0)",
+        help="Global scale applied to the summed TA task vector or merged TIES/TSVM/WUDI/DC/Iso-C/Iso-CTS/RAM+/CABS task vector; OrthoMerge-G scales only residuals (default: 1.0)",
     )
     parser.add_argument(
         "--teacher-names",
@@ -2368,7 +2563,11 @@ def _parse_args() -> argparse.Namespace:
         help="Pass trust_remote_code to transformers (default: True)",
     )
     parser.add_argument("--device", default="auto",
-                        help="Compute device: auto, cpu, cuda:0, ... (default: auto; TA/TIES auto requires CUDA, explicit cpu supported; Iso-C/Iso-CTS require CUDA for matrices; RAM+/OrthoMerge-G require CUDA)")
+                        help="Compute device: auto, cpu, cuda:0, ... (default: auto; TA/TIES auto requires CUDA, explicit cpu supported; Iso-C/Iso-CTS require CUDA for matrices; RAM+/OrthoMerge-G/CABS require CUDA)")
+    parser.add_argument("--cabs-n", type=int, default=64,
+                        help="CABS positions retained per group, 0 <= n <= m (default: 64)")
+    parser.add_argument("--cabs-m", type=int, default=256,
+                        help="CABS consecutive group size, positive; tail keeps min(n, length) (default: 256)")
     parser.add_argument("--ram-threshold", type=float, default=1e-5,
                         help="RAM+ active update threshold, nonnegative (default: 1e-5)")
     parser.add_argument("--ram-rescale-factor", type=float, default=1.2,
@@ -2401,7 +2600,7 @@ def main() -> None:
             f"got {len(teacher_names)}."
         )
     base_path = Path(args.base)
-    if args.method in ("tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g"):
+    if args.method in ("tsvm", "wudi", "dc", "iso_c", "iso_cts", "ram_plus", "orthomerge_g", "cabs"):
         _parse_size_bytes(args.max_shard_size)
         if Path(args.output).resolve() in {base_path.resolve(), *(p.resolve() for p in teacher_paths)}:
             raise ValueError(f"{args.method.upper()} output directory must differ from all input checkpoints")
@@ -2444,6 +2643,11 @@ def main() -> None:
         elif args.method == "orthomerge_g":
             merged = merge_orthomerge_g(
                 base_state, teacher_states, scale=args.scale, device=args.device,
+            )
+        elif args.method == "cabs":
+            merged = merge_cabs(
+                base_state, teacher_states, scale=args.scale, device=args.device,
+                n=args.cabs_n, m=args.cabs_m,
             )
         elif args.method == "ram_plus":
             merged = merge_ram_plus(
