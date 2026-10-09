@@ -23,6 +23,10 @@ Saliency and task-vector differences are computed in FP32; synthetic forward
 precision remains controlled by --compute-dtype. Repair accumulation is FP32
 with one final cast to context storage precision.
 
+--random-channels skips channel saliency and uniformly samples channels without
+replacement for each selecting task at each shared expert. It uses an independent
+CPU generator seeded by --seed; expert scoring and repair coefficients are unchanged.
+
 Optional --apply-svc calibrates non-expert 2D floating-point context-minus-base
 updates using the target teachers (arXiv:2602.05536v2, Eqs. 17-23). Calibration
 runs in CUDA FP32 during streaming checkpoint saving; expert repair and scoring
@@ -367,18 +371,38 @@ def build_channel_selections(
     keep_fraction: float,
     device: torch.device,
     expert_batch_size: int,
+    random_channels: bool = False,
+    seed: int = 42,
 ) -> ChannelSelections:
-    """Read only shared slots selected by each task; retain compact CPU masks."""
+    """Build CPU masks for shared slots, from saliency or random sampling."""
     if expert_batch_size <= 0:
         raise ValueError("expert_batch_size must be positive")
     if not math.isfinite(keep_fraction) or not 0 <= keep_fraction <= 1:
         raise ValueError("channel keep fraction must be finite and in [0, 1]")
+    generator = None
+    if random_channels:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(seed)
     selections: ChannelSelections = {slot: {} for slot in shared_tasks}
     for layout in layouts:
         for task, teacher in teachers.items():
             ids = sorted(e for (layer, e), tasks in shared_tasks.items()
                          if layer == layout.layer_index and task in tasks)
             if not ids:
+                continue
+            if random_channels:
+                count = math.floor(layout.intermediate_size * keep_fraction)
+                print(f"Random channels {layout.label}, task={task}: "
+                      f"{len(ids)} shared experts, keeping {count}/{layout.intermediate_size}")
+                for e in ids:
+                    retained = tuple(sorted(torch.randperm(
+                        layout.intermediate_size, generator=generator, device="cpu"
+                    )[:count].tolist()))
+                    mask = torch.zeros(layout.intermediate_size, dtype=torch.bool)
+                    if retained:
+                        mask[list(retained)] = True
+                    selections[(layout.layer_index, e)][task] = ChannelSelection(
+                        mask, retained, None)
                 continue
             print(f"Connection scoring {layout.label}, task={task}: {len(ids)} shared experts")
             for offset in range(0, len(ids), expert_batch_size):
@@ -700,6 +724,7 @@ def _save_reports(
     device: torch.device,
     compute_dtype: torch.dtype,
     svc_report: dict | None = None,
+    random_channels: bool = False,
 ) -> None:
     total_slots = sum(layout.num_experts for layout in layouts)
     selected_tasks_by_slot: dict[Slot, list[str]] = {}
@@ -743,11 +768,22 @@ def _save_reports(
         "reference_repair_scores": (str(reference_repair_scores.resolve())
                                     if reference_repair_scores is not None else None),
         "channel_keep_fraction": channel_keep_fraction,
-        "channel_score_dtype": "float32",
-        "connection_proxy": "sum_j g_j * u_j * d_j; teacher L1 connection strengths",
-        "channel_score": "sum_{p in channel_j} abs((teacher_p-base_p) * dR/dtheta_p)",
-        "channel_gradient_point": "teacher_weights; abs_subgradient_at_zero=0",
+        "channel_selection_mode": "random" if random_channels else "connection_saliency",
+        "channel_score_dtype": None if random_channels else "float32",
+        "connection_proxy": (
+            None if random_channels else "sum_j g_j * u_j * d_j; teacher L1 connection strengths"
+        ),
+        "channel_score": (
+            None if random_channels else "sum_{p in channel_j} abs((teacher_p-base_p) * dR/dtheta_p)"
+        ),
+        "channel_gradient_point": (
+            None if random_channels else "teacher_weights; abs_subgradient_at_zero=0"
+        ),
         "channel_selection_rule": (
+            "uniform random sampling without replacement of "
+            "floor(intermediate_size * channel_keep_fraction) channels per selecting task "
+            "per shared expert; independent CPU generator seeded by seed"
+            if random_channels else
             "top floor(intermediate_size * channel_keep_fraction) per selecting task "
             "per shared expert; ties prefer larger channel indices"
         ),
@@ -928,7 +964,8 @@ def _parse_args() -> argparse.Namespace:
             "Qwen3-VL packed MoE experts: copy the teacher at uniquely selected "
             "slots; at shared slots, add the sum of directionally weighted "
             "teacher-minus-base deltas from all selecting tasks to the context, "
-            "retaining only their highest connection-saliency channels."
+            "retaining their highest connection-saliency channels, or random channels "
+            "with --random-channels."
         )
     )
     parser.add_argument("--base", required=True, help="Local base checkpoint")
@@ -991,7 +1028,8 @@ def _parse_args() -> argparse.Namespace:
         help="Number of shared Rademacher hidden vectors (default: 16)",
     )
     parser.add_argument(
-        "--seed", type=int, default=42, help="Probe RNG seed (default: 42)"
+        "--seed", type=int, default=42,
+        help="Probe and optional random-channel RNG seed (default: 42)"
     )
     parser.add_argument(
         "--expert-batch-size",
@@ -1045,11 +1083,17 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         required=True,
         help=(
-            "Connection-saliency channel fraction kept per selecting task at shared "
+            "Channel fraction kept per selecting task at shared "
             "experts, in [0, 1]; keeps floor(intermediate_size * fraction) channels. "
             "0 retains context at shared slots; 1 keeps all channels. "
             "Independent of --repair-fraction; combined repair uses --shared-repair-scale"
         ),
+    )
+    parser.add_argument(
+        "--random-channels", action="store_true",
+        help=("Uniformly sample channels without replacement per selecting task at "
+              "each shared expert instead of using connection saliency; uses --seed. "
+              "Expert scoring and repair coefficients remain unchanged"),
     )
     parser.add_argument(
         "--shared-repair-scale", type=float, default=1.0,
@@ -1218,6 +1262,7 @@ def main() -> None:
             base, teachers, layouts, shared_tasks,
             keep_fraction=args.channel_keep_fraction,
             device=device, expert_batch_size=args.expert_batch_size,
+            random_channels=args.random_channels, seed=args.seed,
         )
         if args.reference_repair_scores is not None:
             validate_reference_selections(
@@ -1283,6 +1328,7 @@ def main() -> None:
             shared_tasks=shared_tasks,
             channel_selections=channel_selections,
             channel_keep_fraction=args.channel_keep_fraction,
+            random_channels=args.random_channels,
             shared_coefficients=shared_coefficients,
             reference_repair_scores=args.reference_repair_scores,
             increment_norms=repaired_state.increment_norm_report(),
