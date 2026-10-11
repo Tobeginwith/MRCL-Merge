@@ -8,6 +8,9 @@ Other tensor ranks and non-floating tensors are copied from the context model.
 With --moe-only, only packed mlp.experts.gate_up_proj and mlp.experts.down_proj
 are calibrated; all non-expert tensors are copied from the context model.
 This script performs no expert selection or connection repair.
+svc_duration in svc_summary.json is HH-MM-SS elapsed calibration time including
+required reads, transfers and CPU result assembly. Uncalibrated tensor copies,
+checkpoint/processor saving and report writes are excluded.
 
 SVC (arXiv:2602.05536v2) uses context-minus-base and teacher-minus-base updates
 in CUDA FP32, without additional merge scaling. SVD uses the default driver;
@@ -48,6 +51,9 @@ from src.merge.merge_conflict import (  # noqa: E402
     _validate_checkpoint_compatibility,
 )
 from src.merge.merge_conflict_by_connection import (  # noqa: E402
+    _RuntimeTimer,
+    _checkpoint_tensor_is_float,
+    _format_duration,
     _calibrate_svc_matrix,
     _validate_svc_options,
 )
@@ -93,6 +99,7 @@ class SVCCalibratedCheckpoint:
         # Small per-matrix statuses only; repeated reads replace entries.
         self._results: dict[str, tuple[str, str]] = {}
         self._copied_keys: set[str] = set()
+        self.svc_timer = _RuntimeTimer(device)
 
     def keys(self) -> list[str]:
         return self.context.keys()
@@ -104,6 +111,17 @@ class SVCCalibratedCheckpoint:
         return self.context.get_dtype(key)
 
     def get_tensor(self, key: str) -> torch.Tensor:
+        participates = (_checkpoint_tensor_is_float(self.context, key)
+                        and (key in self.expert_key_layout
+                             or (not self.moe_only and len(self.context.get_shape(key)) == 2)))
+        if participates:
+            # One interval includes the context read, all expert projections and
+            # CPU result assembly, but ends before the saver writes any shard.
+            with self.svc_timer.measure():
+                return self._get_tensor(key)
+        return self._get_tensor(key)
+
+    def _get_tensor(self, key: str) -> torch.Tensor:
         context = self.context.get_tensor(key)
         layout = self.expert_key_layout.get(key)
         if (not context.is_floating_point()
@@ -160,6 +178,7 @@ class SVCCalibratedCheckpoint:
 
         return {
             "method": "svc_ablation",
+            "svc_duration": _format_duration(self.svc_timer.seconds),
             "base_model": str(self.base.model_dir.resolve()),
             "context_model": str(self.context.model_dir.resolve()),
             "target_tasks": list(self.teachers),

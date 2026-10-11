@@ -27,6 +27,10 @@ with one final cast to context storage precision.
 replacement for each selecting task at each shared expert. It uses an independent
 CPU generator seeded by --seed; expert scoring and repair coefficients are unchanged.
 
+repair_duration in conflict_repair_summary.json reports HH-MM-SS elapsed work:
+scoring/selection plus streamed repair and optional SVC, including required reads
+and transfers, excluding untouched tensor copies and checkpoint/report writes.
+
 Optional --apply-svc calibrates non-expert 2D floating-point context-minus-base
 updates using the target teachers (arXiv:2602.05536v2, Eqs. 17-23). Calibration
 runs in CUDA FP32 during streaming checkpoint saving; expert repair and scoring
@@ -55,7 +59,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -537,6 +541,48 @@ def _calibrate_svc_matrix(
         raise
 
 
+def _format_duration(seconds: float) -> str:
+    """Format accumulated elapsed time as HH-MM-SS, without a 24-hour wrap."""
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}-{minutes:02d}-{seconds:02d}"
+
+
+class _RuntimeTimer:
+    """Accumulate completed work intervals; None disables timing for other callers."""
+
+    def __init__(self, device: torch.device | None):
+        self.device = device
+        self.seconds = 0.0
+
+    def start(self) -> float | None:
+        if self.device is None:
+            return None
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        return time.perf_counter()
+
+    def stop(self, started: float | None) -> None:
+        if started is None:
+            return
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        self.seconds += time.perf_counter() - started
+
+    @contextmanager
+    def measure(self):
+        started = self.start()
+        yield
+        # Do not synchronize in a finally block: a failed CUDA operation must
+        # keep its original exception, rather than a secondary sync failure.
+        self.stop(started)
+
+
+def _checkpoint_tensor_is_float(checkpoint: SafetensorCheckpoint, key: str) -> bool:
+    """Use safetensors metadata to decide timing scope before loading weights."""
+    return checkpoint.get_dtype(key).startswith(("F", "BF"))
+
+
 class ConnectionRepairCheckpoint(ConflictRepairCheckpoint):
     """Use the existing checkpoint interface with channel-masked shared updates."""
 
@@ -555,6 +601,7 @@ class ConnectionRepairCheckpoint(ConflictRepairCheckpoint):
         svc_device: torch.device | None = None,
         svc_alpha: float = 1.0,
         svc_eps: float = 1e-12,
+        timing_device: torch.device | None = None,
     ) -> None:
         if not math.isfinite(shared_repair_scale) or shared_repair_scale < 0:
             raise ValueError("shared_repair_scale must be finite and nonnegative")
@@ -581,6 +628,8 @@ class ConnectionRepairCheckpoint(ConflictRepairCheckpoint):
         self.svc_alpha = svc_alpha
         self.svc_eps = svc_eps
         self._svc_results: dict[str, str] = {}
+        self.repair_timer = _RuntimeTimer(timing_device)
+        self._repair_layers = {slot[0] for slot in (*repair_sources, *shared_tasks)}
         if svc_device is not None:
             _validate_svc_options(svc_alpha, svc_eps)
             if svc_device.type != "cuda" or not torch.cuda.is_available():
@@ -589,6 +638,22 @@ class ConnectionRepairCheckpoint(ConflictRepairCheckpoint):
                 raise ValueError("SVC requires at least one target teacher")
 
     def get_tensor(self, key: str) -> torch.Tensor:
+        # Other scripts inheriting this checkpoint retain their existing path.
+        if self.repair_timer.device is None:
+            return self._get_tensor(key)
+        layout = self.expert_key_layout.get(key)
+        participates = (layout is not None and layout.layer_index in self._repair_layers)
+        if layout is None and self.svc_device is not None:
+            participates = (len(self.context.get_shape(key)) == 2
+                            and _checkpoint_tensor_is_float(self.context, key)
+                            and "mlp.experts.down_proj" not in key
+                            and "mlp.experts.gate_up_proj" not in key)
+        if participates:
+            with self.repair_timer.measure():
+                return self._get_tensor(key)
+        return self._get_tensor(key)
+
+    def _get_tensor(self, key: str) -> torch.Tensor:
         if self.svc_device is None or key in self.expert_key_layout:
             return super().get_tensor(key)
         context = self.context.get_tensor(key)
@@ -725,6 +790,7 @@ def _save_reports(
     compute_dtype: torch.dtype,
     svc_report: dict | None = None,
     random_channels: bool = False,
+    repair_elapsed_seconds: float = 0.0,
 ) -> None:
     total_slots = sum(layout.num_experts for layout in layouts)
     selected_tasks_by_slot: dict[Slot, list[str]] = {}
@@ -738,6 +804,7 @@ def _save_reports(
     report = {
         "method": "data_free_multi_task_post_merge_connection_conflict_repair",
         "expert_scoring": scoring_info,
+        "repair_duration": _format_duration(repair_elapsed_seconds),
         "base_model": str(base_dir.resolve()),
         "context_model": str(context_dir.resolve()),
         "target_tasks": list(target_teacher_dirs),
@@ -1034,8 +1101,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expert-batch-size",
         type=int,
-        default=8,
-        help="Experts scored together on the compute device (default: 8)",
+        default=128,
+        help="Experts scored together on the compute device (default: 128)",
     )
     parser.add_argument(
         "--device",
@@ -1235,6 +1302,10 @@ def main() -> None:
             base_dir, context_dir, target_teacher_dirs, num_probes=args.num_probes,
             seed=args.seed, compute_dtype=compute_dtype, eps=args.eps,
         )
+        # Include this run's cache I/O, scoring, selection and mask construction;
+        # checkpoint indexing and probe construction have already completed.
+        preparation_timer = _RuntimeTimer(device)
+        preparation_started = preparation_timer.start()
         scores_by_task, scoring_info = score_repairs_with_cache(
             base, context, teachers, layouts, probes,
             cache_dir=args.score_cache_dir, cache_config=cache_config,
@@ -1297,7 +1368,9 @@ def main() -> None:
             svc_device=device if args.apply_svc else None,
             svc_alpha=args.svc_alpha,
             svc_eps=args.svc_eps,
+            timing_device=device,
         )
+        preparation_timer.stop(preparation_started)
         # All input/reference checks, scoring and mask construction have succeeded.
         # Only now begin replacing the output checkpoint.
         # Invalidate completion before cleanup, which can itself fail partway.
@@ -1334,6 +1407,7 @@ def main() -> None:
             increment_norms=repaired_state.increment_norm_report(),
             svc_report=repaired_state.svc_report(),
             scoring_info=scoring_info,
+            repair_elapsed_seconds=preparation_timer.seconds + repaired_state.repair_timer.seconds,
             shared_repair_scale=args.shared_repair_scale,
             base_dir=base_dir,
             context_dir=context_dir,
