@@ -183,8 +183,14 @@ class VLMInference:
         max_completion_length: int = 2048,
         temperature: float = 1.0,
         top_p: float = 1.0,
-        repetition_penalty: float = 1.05
+        repetition_penalty: float = 1.05,
+        image_min_pixels: int = 8 * 32 * 32,
+        image_max_pixels: int = 512 * 32 * 32
     ):
+        if not 0 < image_min_pixels <= image_max_pixels:
+            raise ValueError("Image pixel limits must satisfy 0 < image_min_pixels <= image_max_pixels")
+        self.image_min_pixels = image_min_pixels
+        self.image_max_pixels = image_max_pixels
         self.base_model_path = base_model_path
         self.test_file = test_file
         self.output_dir = output_dir
@@ -436,8 +442,8 @@ class VLMInference:
         else:
             raise NotImplementedError(f"Test file {test_file} not supported for prompt building.")
 
-        min_pixels = 8 * 32 * 32
-        max_pixels = 512 * 32 * 32
+        min_pixels = self.image_min_pixels
+        max_pixels = self.image_max_pixels
         
         # Check for image tags using regex to handle interleaving
         split_pattern = r"(<image(?:[\s_]+\d+)?>)"
@@ -473,7 +479,7 @@ class VLMInference:
         else:
              raise RuntimeError("Tokenizer not initialized.")
 
-        image_inputs, _ = process_vision_info(conversation)
+        image_inputs, _ = process_vision_info(conversation, image_patch_size=16)
         return final_prompt, image_inputs
 
 
@@ -613,6 +619,8 @@ def main():
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--disable_flash_attn2', action='store_true', help='Disable Flash Attention 2 and use SDPA instead')
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size for inference')
+    parser.add_argument('--image_min_pixels', type=int, default=8 * 32 * 32, help='Minimum image pixel count for preprocessing')
+    parser.add_argument('--image_max_pixels', type=int, default=512 * 32 * 32, help='Maximum image pixel count for preprocessing')
     
     args = parser.parse_args()
     with open(args.prompts_file, "r") as file:
@@ -631,7 +639,9 @@ def main():
         max_completion_length=args.max_completion_length,
         temperature=args.temperature,
         top_p=args.top_p,
-        repetition_penalty=args.repetition_penalty
+        repetition_penalty=args.repetition_penalty,
+        image_min_pixels=args.image_min_pixels,
+        image_max_pixels=args.image_max_pixels
     )
 
     datasets_parquet = [

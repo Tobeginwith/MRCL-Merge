@@ -69,6 +69,11 @@ for TEST_DATASET in "${SELECTED_DATASETS[@]}"; do
     TEST_FILE=${BASE_PATH}/${TEST_DATASET}/jsons/test/data.json
     MEDIA_DIR=${BASE_PATH}/${TEST_DATASET}/images
     RESULTS_DIR=${BASE_RESULTS_DIR}/${MODEL_LABEL}/${TEST_DATASET}
+    # Match the per-task image pixel limits in SFT-30B/run.sh.
+    case "$TEST_DATASET" in
+        MedBookVQA|Navigation) MIN_PIXELS=$((128*32*32)); MAX_PIXELS=$((512*32*32)) ;;
+        We-Math2|Puzzle|FinMME) MIN_PIXELS=$((64*32*32)); MAX_PIXELS=$((256*32*32)) ;;
+    esac
 
     if [ ! -f "$TEST_FILE" ]; then
         echo "Test data not found: ${TEST_FILE}" >&2
@@ -94,6 +99,7 @@ for TEST_DATASET in "${SELECTED_DATASETS[@]}"; do
     echo "--------------------------------------"
     echo "Test dataset: ${TEST_DATASET}"
     echo "Results: ${RESULTS_DIR}"
+    echo "Image pixels: min=${MIN_PIXELS}, max=${MAX_PIXELS}"
     echo "--------------------------------------"
 
     export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -103,6 +109,8 @@ for TEST_DATASET in "${SELECTED_DATASETS[@]}"; do
         --media_dir "$MEDIA_DIR" \
         --output_dir "$RESULTS_DIR" \
         --prompts_file src/dataset/prompts_1.yaml \
+        --image_min_pixels "$MIN_PIXELS" \
+        --image_max_pixels "$MAX_PIXELS" \
         --max_completion_length 2048 \
         --temperature 0.0 \
         --top_p 1.0 \
